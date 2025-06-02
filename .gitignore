@@ -1,0 +1,62 @@
+# IDE specific files
+.vscode/
+*.code-workspace
+
+# C/C++ specific
+## CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeLists.txt.user
+compile_commands.json
+Makefile
+*.make
+
+## Build output
+build/
+bin/
+lib/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.ipch/ # IntelliSense Precompiled Header
+
+## Ninja
+.ninja_deps
+.ninja_log
+
+## Compiled executables
+*.exe
+*.out
+
+## Go build cache
+*.test
+*.prof
+
+# Operating System generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Log files
+*.log
+
+# Temporary files
+*~
+*.tmp
+*.swp
+*.swo
+
+# Examples
+examples/c-cpp/build/
+examples/c-cpp/chat_client.exe
+
