@@ -4,23 +4,31 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
+)
+
+const (
+	MaxClients        = 100
+	ConnectionTimeout = 30 * time.Second
+	ServerPort        = ":3000"
 )
 
 var (
-	clients   = make(map[net.Conn]*Client)
-	mutex     sync.Mutex
-	broadcast = make(chan Message)
+	clients     = make(map[net.Conn]*Client)
+	mutex       sync.RWMutex
+	broadcast   = make(chan Message, 1000) // Buffered to prevent blocking
+	clientCount int
 )
 
 func Start() {
-	ln, err := net.Listen("tcp", ":3000")
-
+	ln, err := net.Listen("tcp", ServerPort)
 	if err != nil {
 		panic(err)
 	}
-
 	defer ln.Close()
-	fmt.Println("[SERVER] Listening port 3000...")
+
+	fmt.Printf("[SERVER] Listening on port %s...\n", ServerPort)
+	fmt.Printf("[SERVER] Max clients: %d\n", MaxClients)
 
 	go broadcaster()
 
@@ -30,47 +38,88 @@ func Start() {
 			fmt.Println("[ERROR] Connection refused:", err)
 			continue
 		}
+
+		// Check connection limits
+		mutex.RLock()
+		currentClients := clientCount
+		mutex.RUnlock()
+
+		if currentClients >= MaxClients {
+			fmt.Printf("[WARN] Connection limit reached, rejecting %s\n", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+
 		go handleConnection(conn)
 	}
 }
 
 func handleConnection(conn net.Conn) {
+	// Set connection timeout only for initial handshake
+	conn.SetReadDeadline(time.Now().Add(ConnectionTimeout))
+
 	client := NewClient(conn)
 	if client == nil {
 		return
 	}
 
 	RegisterClient(client)
+	defer UnregisterClient(client)
+
+	// Client handles clearing timeouts in Listen()
 	client.Listen()
-	UnregisterClient(client)
 }
 
 func RegisterClient(c *Client) {
 	mutex.Lock()
 	clients[c.conn] = c
+	clientCount++
 	mutex.Unlock()
 
+	fmt.Printf("[INFO] %s joined (clients: %d)\n", c.nickname, clientCount)
+
 	msg := Message{From: "Server", Text: c.nickname + " joined the chatroom"}
-	broadcast <- msg
+	select {
+	case broadcast <- msg:
+	default:
+		fmt.Println("[WARN] Broadcast channel full, dropping join message")
+	}
 }
 
 func UnregisterClient(c *Client) {
 	mutex.Lock()
-	delete(clients, c.conn)
+	if _, exists := clients[c.conn]; exists {
+		delete(clients, c.conn)
+		clientCount--
+	}
 	mutex.Unlock()
 
+	c.conn.Close()
+	close(c.ch)
+
+	fmt.Printf("[INFO] %s left (clients: %d)\n", c.nickname, clientCount)
+
 	msg := Message{From: "Server", Text: c.nickname + " left the chatroom"}
-	broadcast <- msg
+	select {
+	case broadcast <- msg:
+	default:
+		fmt.Println("[WARN] Broadcast channel full, dropping leave message")
+	}
 }
 
 func broadcaster() {
 	for msg := range broadcast {
-		mutex.Lock()
+		mutex.RLock()
 		for _, c := range clients {
 			if c.nickname != msg.From {
-				c.Send(msg)
+				select {
+				case c.ch <- msg:
+				default:
+					// Client's channel is full, skip this message
+					fmt.Printf("[WARN] Message dropped for %s (channel full)\n", c.nickname)
+				}
 			}
 		}
-		mutex.Unlock()
+		mutex.RUnlock()
 	}
 }

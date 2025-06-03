@@ -4,6 +4,7 @@
 
 # C/C++ specific
 ## CMake
+cmake-build-debug/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -59,4 +60,3 @@ Thumbs.db
 # Examples
 examples/c-cpp/build/
 examples/c-cpp/chat_client.exe
-
