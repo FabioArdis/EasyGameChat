@@ -6,6 +6,10 @@
 * this overlap, leaving console interface management to the programmer.
 */
 
+#if defined(_WIN32) && !defined(SECURITY_WIN32)
+#define SECURITY_WIN32
+#endif
+
 #include "../../clients/c-cpp/EasyGameChat.h"
 
 #include <iostream>
