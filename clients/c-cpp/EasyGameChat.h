@@ -560,6 +560,7 @@ public:
   }
 
   ssize_t recv(void* data, size_t len) {
+    //std::cout << "tlsRecv called\n";
     if (!connected) return -1;
 
 #ifdef _WIN32
@@ -780,11 +781,13 @@ private:
   }
 
   ssize_t recvWindows(void* data, size_t len) {
+    //std::cout << "recvWindows called\n";
     static std::vector<char> decryptBuffer;
     static size_t decryptBufferUsed = 0;
 
     if (decryptBuffer.empty()) {
-      decryptBuffer.resize(16384);
+        decryptBuffer.resize(16384);
+        //std::cout << "[DEBUG] decryptBuffer initialized to 16384 bytes\n";
     }
 
     // We need to check if /exit was called
@@ -797,20 +800,37 @@ private:
     timeout.tv_usec = 100 * 1000; // 100ms timeout
 
     int result = select(socket + 1, &readSet, nullptr, nullptr, &timeout);
-    if (result < 0) return -1; // select() error
-    if (result == 0) return 0; // timeout - no data, retry in recvLoop()
+    if (result < 0) {
+      perror("[ERROR] select failed");
+      return -1;
+    }
+    if (result == 0) {
+      //std::cout << "[DEBUG] select timed out (no data)\n";
+#ifdef _WIN32
+      WSASetLastError(WSAEWOULDBLOCK);
+#else
+      errno = EAGAIN;
+#endif
+      return -1;
+    }
 
     ssize_t received = ::recv(socket, readBuffer.data(), readBuffer.size(), 0);
-    if (received <= 0) return received;
+    if (received <= 0) {
+      //std::cout << "[DEBUG] recv returned" << received;
+      return received;
+    }
+    //std::cout << "[DEBUG] Received" << received << " bytes from socket\n";
 
     SecBuffer buffers[4];
     buffers[0].pvBuffer = readBuffer.data();
     buffers[0].cbBuffer = static_cast<unsigned long>(received);
     buffers[0].BufferType = SECBUFFER_DATA;
 
-    buffers[1].BufferType = SECBUFFER_EMPTY;
-    buffers[2].BufferType = SECBUFFER_EMPTY;
-    buffers[3].BufferType = SECBUFFER_EMPTY;
+    for (int i = 1; i < 4; ++i) {
+      buffers[i].BufferType = SECBUFFER_EMPTY;
+      buffers[i].pvBuffer = nullptr;
+      buffers[i].cbBuffer = 0;
+    }
 
     SecBufferDesc bufferDesc;
     bufferDesc.ulVersion = SECBUFFER_VERSION;
@@ -818,16 +838,22 @@ private:
     bufferDesc.pBuffers = buffers;
 
     SECURITY_STATUS status = DecryptMessage(&context, &bufferDesc, 0, nullptr);
-    if (status != SEC_E_OK) return -1;
+    if (status != SEC_E_OK) {
+      std::cerr << "[ERROR] DecryptMessage failed: " << status << "\n";
+      return -1;
+    }
 
     for (int i = 0; i < 4; i++) {
+      //printf("[DEBUG] Buffer[%d]: type=%lu, size=%lu\n", i, buffers[i].BufferType, buffers[i].cbBuffer);
       if (buffers[i].BufferType == SECBUFFER_DATA && buffers[i].cbBuffer > 0) {
         size_t copySize = std::min(len, static_cast<size_t>(buffers[i].cbBuffer));
         memcpy(data, buffers[i].pvBuffer, copySize);
+        //printf("[DEBUG] Copied %zu bytes of decrypted data to output buffer\n", copySize);
         return static_cast<ssize_t>(copySize);
       }
     }
 
+    //std::cout << "[DEBUG] No decrypted data found in buffers\n";
     return 0;
   }
 
@@ -1271,7 +1297,7 @@ void EasyGameChat::recvLoop() {
     ssize_t received;
 
     if (_useTLS && _tlsSocket) {
-      //std::cout << "[DEBUG] TLS recv called\n";
+      //std::cout << "[DEBUG] about to call TLS recv called\n";
       received = _tlsSocket->recv(buffer.data(), buffer.size() - 1);
       //std::cout << "[DEBUG] TLS recv returned " << received << "\n";
     } else {
@@ -1353,18 +1379,13 @@ void EasyGameChat::recvLoop() {
       break; // Connection closed
     }
     else {
-      // received < 0
-      if (_useTLS) {
-        break; // handle TLS-specific errors
-      } else {
 #ifdef _WIN32
-        int err = WSAGetLastError();
-        if (err != WSAEWOULDBLOCK) {
+      int err = WSAGetLastError();
+      if (err != WSAEWOULDBLOCK) {
 #else
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+      if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
 #endif
-          break; // Real error
-        }
+        break; // Real error
       }
     }
   }

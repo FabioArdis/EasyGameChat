@@ -56,7 +56,7 @@ func StartTLS() {
 	fmt.Printf("[SERVER] Max clients: %d\n", MaxClients)
 	fmt.Printf("[SERVER] Using TLS certificate: %s\n", CertFile)
 
-	go broadcaster()
+	go debugBroadcaster()
 
 	for {
 		conn, err := ln.Accept()
@@ -93,7 +93,7 @@ func Start() {
 	fmt.Printf("[SERVER] Listening on port %s...\n", ServerPort)
 	fmt.Printf("[SERVER] Max clients: %d\n", MaxClients)
 
-	go broadcaster()
+	go debugBroadcaster()
 
 	for {
 		conn, err := ln.Accept()

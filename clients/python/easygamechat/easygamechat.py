@@ -4,6 +4,7 @@ A secure, feature-complete port of the C++ EasyGameChat library
 """
 
 import socket
+import ssl
 import json
 import threading
 import time
@@ -131,17 +132,31 @@ class EasyGameChat:
             client.disconnect()
     """
     
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, use_tls: bool = True,
+                 verify_cert: bool = True, ca_cert_path: Optional[str] = None,
+                 client_cert_path: Optional[str] = None, client_key_path: Optional[str] = None):
         """
         Initialize EasyGameChat client.
         
         Args:
             host: Server hostname or IP address
             port: Server port number
+            use_tls: Enable TLS encryption (default: True)
+            verify_cert: Verify server certificate (default: True)
+            ca_cert_path: Path to CA certificate file (optional)
+            client_cert_path: Path to client certificate for mutual TLS (optional)
+            client_key_path: Path to client private key for mutual TLS (optional)
         """
         self.host = host
         self.port = port
+        self.use_tls = use_tls
+        self.verify_cert = verify_cert
+        self.ca_cert_path = ca_cert_path
+        self.client_cert_path = client_cert_path
+        self.client_key_path = client_key_path
+
         self.socket: Optional[socket.socket] = None
+        self.tls_socket: Optional[ssl.SSLSocket] = None
         self.nickname = ""
         self.running = False
         self.should_stop = False
@@ -153,10 +168,48 @@ class EasyGameChat:
         
         # Configure logging
         self.logger = logging.getLogger(f"EasyGameChat-{id(self)}")
+
+        # Setup TLS context if needed
+        self.ssl_context = None
+        if self.use_tls:
+            self._setup_ssl_context()
+    
+    def _setup_ssl_context(self):
+        """Setup SSL context with security configurations"""
+        try:
+            self.ssl_context = ssl.create_default_context()
+
+            if not self.verify_cert:
+                self.ssl_context.check_hostname = False
+                self.ssl_context.verify_mode = ssl.CERT_NONE
+                self.logger.warning("Certificate verification disabled - use only for testing!")
+            else:
+                self.ssl_context.verify_mode = ssl.CERT_REQUIRED
+                self.ssl_context.check_hostname = True
+            
+            if self.ca_cert_path:
+                self.ssl_context.load_verify_locations(self.ca_cert_path)
+            
+            if self.client_cert_path and self.client_key_path:
+                self.ssl_context.load_cert_chain(self.client_cert_path, self.client_key_path)
+
+            self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
+            self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+            self.ssl_context.options |= ssl.OP_NO_SSLv2
+            self.ssl_context.options |= ssl.OP_NO_SSLv3
+            self.ssl_context.options |= ssl.OP_NO_TLSv1
+            self.ssl_context.options |= ssl.OP_NO_TLSv1_1
+            self.ssl_context.options |= ssl.OP_SINGLE_DH_USE
+            self.ssl_context.options |= ssl.OP_SINGLE_ECDH_USE
+
+        except Exception as e:
+            self.logger.error(f"Failed to setup SSL context: {e}")
+            raise TLSError(f"SSL context setup failed: {e}")
     
     def connect(self, nickname: str) -> bool:
         """
-        Connect to the chat server with the given nickname.
+        Connect to the chat server with the given nickname using TLS if enabled.
         
         Args:
             nickname: User's nickname (must pass validation)
@@ -179,9 +232,51 @@ class EasyGameChat:
             
             # Connect to server
             self.socket.connect((self.host, self.port))
+
+            # Setup TLS if enabled
+            if self.use_tls:
+                if not self.ssl_context:
+                    self.logger.error("SSL context not initialized")
+                    self.socket.close()
+                    return False
+                
+                try:
+                    # Wrap socket with TLS
+                    self.tls_socket = self.ssl_context.wrap_socket(
+                        self.socket,
+                        server_hostname=self.host if self.verify_cert else None
+                    )
+
+                    # Perform TLS handshake
+                    self.tls_socket.do_handshake()
+
+                    # Log TLS connection info
+                    cipher = self.tls_socket.cipher()
+                    if cipher:
+                        self.logger.info(f"TLS connection established: {cipher[0]} {cipher[1]}")
+
+                    # Get peer certificate info
+                    if self.verify_cert:
+                        cert = self.tls_socket.getpeercert()
+                        if cert:
+                            subject = dict(x[0] for x in cert['subject'])
+                            self.logger.info(f"Server certificate: {subject.get('commonName', 'Unknown')}")
+                    
+                    # Use TLS socket for communication
+                    active_socket = self.tls_socket
+
+                except ssl.SSLError as e:
+                    self.logger.error(f"TLS handshake failed: {e}")
+                    self.socket.close()
+                    self.socket = None
+                    return False
+            
+            else:
+                # Use plain socket
+                active_socket = self.socket
             
             # Set non-blocking for receive operations
-            self.socket.settimeout(RECV_TIMEOUT_MS / 1000.0)
+            active_socket.settimeout(RECV_TIMEOUT_MS / 1000.0)
             
             self.nickname = nickname
             
@@ -192,8 +287,7 @@ class EasyGameChat:
             }
             
             if not self._send_json(hello_msg):
-                self.socket.close()
-                self.socket = None
+                self._close_connection()
                 return False
             
             # Start receive thread
@@ -206,9 +300,7 @@ class EasyGameChat:
             
         except Exception as e:
             self.logger.error(f"Connection failed: {e}")
-            if self.socket:
-                self.socket.close()
-                self.socket = None
+            self._close_connection()
             return False
     
     def send_message(self, text: str) -> bool:
@@ -221,7 +313,7 @@ class EasyGameChat:
         Returns:
             True if message sent successfully, False otherwise
         """
-        if not self.socket or not self.running:
+        if not self._get_active_socket() or not self.running:
             return False
         
         # Validate message
@@ -265,16 +357,71 @@ class EasyGameChat:
             if self.recv_thread and self.recv_thread.is_alive():
                 self.recv_thread.join(timeout=1.0)
             
-            if self.socket:
-                try:
-                    self.socket.close()
-                except:
-                    pass
-                self.socket = None
+            self._close_connection()
+
+    def get_connection_info(self) -> Dict[str, Any]:
+        """
+        Get information about the current connection.
+        
+        Returns:
+            Dictionary with connection details including TLS info
+        """
+
+        info = {
+            "connected": self.running,
+            "host": self.host,
+            "port": self.port,
+            "nickname": self.nickname,
+            "tls_enabled": self.use_tls,
+        }
+
+        if self.use_tls and self.tls_socket:
+            try:
+                cipher = self.tls_socket.cipher()
+                if cipher:
+                    info["tls_cipher"] = cipher[0]
+                    info["tls_version"] = cipher[1]
+                    info["tls_bits"] = cipher[2]
+                
+                if self.verify_cert:
+                    cert = self.tls_socket.getpeercert()
+                    if cert:
+                        subject = dict(x[0] for x in cert['subject'])
+                        info["server_cert_cn"] = subject.get('commonName', 'Unknown')
+                        info["server_cert_valid"] = True
+            except Exception as e:
+                info["tls_error"] = str(e)
+        
+        return info
+    
+    def _get_active_socket(self) -> Optional[socket.socket]:
+        """Get the active socket (TLS or plain)"""
+        if self.use_tls:
+            return self.tls_socket
+        return self.socket
+    
+    def _close_connection(self):
+        """Close all socket connections"""
+        if self.tls_socket:
+            try:
+                self.tls_socket.close()
+            except:
+                pass
+            self.tls_socket = None
+        
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+            self.socket = None
+
     
     def _send_json(self, data: Dict[str, Any]) -> bool:
         """Send JSON data to server with validation."""
-        if not self.socket:
+        active_socket = self._get_active_socket()
+
+        if not active_socket:
             return False
         
         try:
@@ -294,7 +441,7 @@ class EasyGameChat:
             
             while total_sent < len(message_bytes) and retries < max_retries:
                 try:
-                    sent = self.socket.send(message_bytes[total_sent:])
+                    sent = active_socket.send(message_bytes[total_sent:])
                     if sent == 0:
                         return False  # Connection closed
                     total_sent += sent
@@ -303,7 +450,8 @@ class EasyGameChat:
                     retries += 1
                     time.sleep(0.01)  # 10ms delay
                     continue
-                except Exception:
+                except (ssl.SSLError, socket.error) as e:
+                    self.logger.error(f"Send error: {e}")
                     return False
             
             return total_sent == len(message_bytes)
@@ -316,11 +464,12 @@ class EasyGameChat:
         """Main receive loop running in separate thread."""
         buffer = b''
         max_messages_per_loop = 10  # Prevent message flooding
+        active_socket = self._get_active_socket()
         
         while self.running and not self.should_stop and self.socket:
             try:
                 # Receive data with timeout
-                data = self.socket.recv(MAX_BUFFER_SIZE)
+                data = active_socket.recv(MAX_BUFFER_SIZE)
                 
                 if not data:
                     break  # Connection closed
@@ -351,8 +500,12 @@ class EasyGameChat:
                         
             except socket.timeout:
                 continue  # Normal timeout, check if we should stop
+            except (ssl.SSLError, socket.error) as e:
+                if not self.should_stop:  # Only log if not intentionally stopping
+                    self.logger.error(f"Receive error: {e}")
+                break
             except Exception as e:
-                self.logger.error(f"Receive error: {e}")
+                self.logger.error(f"Unexpected receive error: {e}")
                 break
     
     def _process_message(self, json_str: str):
@@ -388,13 +541,14 @@ _clients: Dict[int, EasyGameChat] = {}
 _client_counter = 0
 _clients_lock = threading.Lock()
 
-def egc_create(host: str, port: int) -> Optional[int]:
+def egc_create(host: str, port: int, use_tls: bool = True) -> Optional[int]:
     """
-    Create a new EasyGameChat client.
+    Create a new EasyGameChat client with TLS support.
     
     Args:
         host: Server hostname or IP
         port: Server port
+        use_tls: Enable TLS encryption (default: True)
         
     Returns:
         Client handle (integer) or None on failure
@@ -405,7 +559,42 @@ def egc_create(host: str, port: int) -> Optional[int]:
         return None
     
     try:
-        client = EasyGameChat(host, port)
+        client = EasyGameChat(host, port, use_tls=use_tls)
+        with _clients_lock:
+            handle = _client_counter
+            _client_counter += 1
+            _clients[handle] = client
+            return handle
+    except Exception:
+        return None
+    
+def egc_create_with_certs(host: str, port: int, verify_cert: bool = True, 
+                         ca_cert_path: Optional[str] = None,
+                         client_cert_path: Optional[str] = None, 
+                         client_key_path: Optional[str] = None) -> Optional[int]:
+    """
+    Create a new EasyGameChat client with custom TLS certificate configuration.
+    
+    Args:
+        host: Server hostname or IP
+        port: Server port
+        verify_cert: Verify server certificate
+        ca_cert_path: Path to CA certificate file
+        client_cert_path: Path to client certificate for mutual TLS
+        client_key_path: Path to client private key for mutual TLS
+        
+    Returns:
+        Client handle (integer) or None on failure
+    """
+    global _client_counter
+    
+    if not host or port <= 0 or port > 65535:
+        return None
+    
+    try:
+        client = EasyGameChat(host, port, use_tls=True, verify_cert=verify_cert,
+                             ca_cert_path=ca_cert_path, client_cert_path=client_cert_path,
+                             client_key_path=client_key_path)
         with _clients_lock:
             handle = _client_counter
             _client_counter += 1
@@ -443,37 +632,3 @@ def egc_destroy(handle: int):
         client = _clients.pop(handle, None)
         if client:
             client.disconnect()
-
-# Example usage
-if __name__ == "__main__":
-    import sys
-    
-    def on_message(from_user: str, text: str):
-        print(f"[{from_user}]: {text}")
-    
-    # Get nickname from user
-    nickname = input("Insert your nickname: ").strip()
-    
-    # Create and connect client
-    client = EasyGameChat("127.0.0.1", 3000)
-    client.set_message_callback(on_message)
-    
-    if not client.connect(nickname):
-        print("Error: could not connect to the server")
-        sys.exit(1)
-    
-    print("Connected! Write messages and press ENTER to send them (write '/exit' to exit)")
-    
-    try:
-        while True:
-            message = input().strip()
-            if message == "/exit":
-                break
-            if message:  # Don't send empty messages
-                if not client.send_message(message):
-                    print("Failed to send message (rate limited or invalid)")
-    except KeyboardInterrupt:
-        pass
-    finally:
-        client.disconnect()
-        print("Disconnected.")
