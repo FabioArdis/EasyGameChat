@@ -37,6 +37,13 @@
   #include <Windows.h>
   typedef int socklen_t;
   typedef SSIZE_T ssize_t;
+  #include <schannel.h>
+  #include <security.h>
+  #include <sspi.h>
+  #pragma comment(lib, "secur32.lib")
+  #pragma comment(lib, "crypt32.lib")
+  #include <locale>
+  #include <codecvt>
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -48,6 +55,10 @@
   #include <string.h>
   #include <time.h>
   #include <sys/select.h>
+  #include <openssl/ssl.h>
+  #include <openssl/err.h>
+  #include <openssl/bio.h>
+  #include <openssl/x509v3.h>
 #endif
 
 #include <stdbool.h>
@@ -58,6 +69,20 @@ extern "C" {
 
 // --- C API ---
 
+typedef struct {
+  bool connected;
+  char host[256];
+  int port;
+  char nickname[64];
+  bool tls_enabled;
+  char tls_cipher[128];
+  char tls_version[32];
+  int tls_bits;
+  char server_cert_cn[256];
+  bool server_cert_valid;
+  char tls_error[512];
+} egc_connection_info_t;
+
 /**
  * @brief Callback function type for receiving chat messages
  * 
@@ -66,7 +91,7 @@ extern "C" {
  * receive thread.
  * 
  * @param from The nickname of the message sender (null-terminated string)
- * @param text The message content (null-terminated string)
+* @param text The message content (null-terminated string)
  * @param user_data User-provided data pointer passed to egc_set_message_callback
  * 
  * @note The strings pointed to by 'from' and 'text' are only valid during
@@ -191,6 +216,8 @@ void egc_poll(egc_client_t* client);
  */
 void egc_destroy(egc_client_t* client);
 
+bool egc_get_connection_info(egc_client_t* client, egc_connection_info_t* info);
+
 #ifdef __cplusplus
 }
 #endif
@@ -218,6 +245,25 @@ void egc_destroy(egc_client_t* client);
  */
 namespace egc {
 
+struct ConnectionInfo {
+  bool connected;
+  std::string host;
+  int port;
+  std::string nickname;
+  bool tls_enabled;
+
+  // TLS-specific fields
+  std::string tls_cipher;
+  std::string tls_version;
+  int tls_bits;
+  std::string server_cert_cn;
+  bool server_cert_valid;
+  std::string tls_error;
+
+  ConnectionInfo() : connected(false), port(0), tls_enabled(false),
+                     tls_bits(0), server_cert_valid(false) {}
+};
+
 // Security-focused constants
 
 /** @brief Maximum allowed nickname length in characters */
@@ -234,6 +280,18 @@ const int CONNECT_TIMEOUT_MS = 5000;
 
 /** @brief Receive operation timeout in milliseconds */
 const int RECV_TIMEOUT_MS = 100;
+
+// TLS Config
+/** @brief Maximum duration allowed for completing a TLS handshake. */
+const int TLS_HANDSHAKE_TIMEOUT_MS = 10000;
+
+/** 
+ * @brief Whether to verify the TLS certificate of the remote server.
+ * 
+ * @note WARNING: This should be set to true in production to ensure secure communication. 
+ * Disabling certificate verification makes the connection vulnerable to man-in-the-middle attacks.
+ */
+const bool VERIFY_TLS_CERTIFICATE = false; // IMPORTANT: Do not forget to set to true for production
 
 /**
  * @brief Cross-platform sleep utility
@@ -448,6 +506,602 @@ inline bool isSecureJson(const std::string& str) {
   return braceCount == 0 && !inString;
 }
 
+class TLSInitializer {
+public:
+  TLSInitializer() {
+#ifndef _WIN32
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+#endif
+  }
+
+  ~TLSInitializer() {
+#ifndef _WIN32
+    EVP_cleanup();
+    ERR_free_strings();
+#endif
+  }
+};
+
+class TLSSocket {
+private:
+#ifdef _WIN32
+  CtxtHandle context;
+  CredHandle credentials;
+  bool contextInitialized = false;
+  bool credentialsInitialized = false;
+  std::vector<char> readBuffer;
+  std::vector<char> writeBuffer;
+#else
+  SSL_CTX* ctx = nullptr;
+  SSL* ssl = nullptr;
+#endif
+  int socket;
+  bool connected = false;
+
+public:
+  TLSSocket() : socket(-1) {
+#ifdef _WIN32
+    readBuffer.resize(16384);
+    writeBuffer.resize(16384);
+#endif
+  }
+
+  ~TLSSocket() {
+    disconnect();
+  }
+
+  bool connect(const std::string& host, int port) {
+    socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (socket < 0) return false;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+
+#ifdef _WIN32
+    if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+      closesocket_x(socket);
+      return false;
+    }
+#else
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+      closesocket_x(socket);
+      return false;
+    }
+#endif
+
+    if (::connect(socket, (sockaddr*)&addr, sizeof(addr)) != 0) {
+      closesocket_x(socket);
+      return false;
+    }
+
+    if (!performTLSHandshake(host)) {
+      closesocket_x(socket);
+      return false;
+    }
+
+    connected = true;
+    return true;
+  }
+
+  ssize_t send(const void* data, size_t len) {
+    if (!connected) return -1;
+
+#ifdef _WIN32
+    return sendWindows(data, len);
+#else
+    return SSL_write(ssl, data, static_cast<int>(len));
+#endif
+  }
+
+  ssize_t recv(void* data, size_t len) {
+    //std::cout << "tlsRecv called\n";
+    if (!connected) return -1;
+
+#ifdef _WIN32
+    return recvWindows(data, len);
+#else
+    int fd = SSL_get_fd(ssl);
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(fd, &readfds);
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = RECV_TIMEOUT_MS * 1000;
+
+    int ready = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
+
+    if (ready > 0) {
+      return SSL_read(ssl, data, static_cast<int>(len));
+    } else if (ready == 0) {
+      errno = EAGAIN;
+      return -1; // Timeout
+    } else {
+      return -1; // Error
+    }
+#endif
+  }
+
+  void disconnect() {
+    if (connected) {
+#ifdef _WIN32
+      if (contextInitialized) {
+        // Send close notify
+        DWORD shutdownType = SCHANNEL_SHUTDOWN;
+        SecBuffer shutdownBuffer;
+        shutdownBuffer.pvBuffer = &shutdownType;
+        shutdownBuffer.cbBuffer = sizeof(shutdownType);
+        shutdownBuffer.BufferType = SECBUFFER_TOKEN;
+        
+        SecBufferDesc shutdownDesc;
+        shutdownDesc.ulVersion = SECBUFFER_VERSION;
+        shutdownDesc.cBuffers = 1;
+        shutdownDesc.pBuffers = &shutdownBuffer;
+        
+        ApplyControlToken(&context, &shutdownDesc);
+        DeleteSecurityContext(&context);
+        contextInitialized = false;
+      }
+      if (credentialsInitialized) {
+        FreeCredentialsHandle(&credentials);
+        credentialsInitialized = false;
+      }
+#else
+      if (ssl) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        ssl = nullptr;
+      }
+      if (ctx) {
+        SSL_CTX_free(ctx);
+        ctx = nullptr;
+      }
+#endif
+      connected = false;
+    }
+
+    if (socket >= 0) {
+      closesocket_x(socket);
+      socket = -1;
+    }
+  }
+
+  bool isConnected() const { return connected; }
+  int getSocket() const { return socket; }
+
+  ConnectionInfo getConnectionInfo(ConnectionInfo info) const {
+    if (!connected) {
+      info.tls_error = "Not connected";
+      return info;
+    }
+
+#ifdef _WIN32
+    return getWindowsConnectionInfo(info);
+#else
+    return getOpenSSLConnectionInfo(info);
+#endif
+  }
+
+#ifdef _WIN32
+  ConnectionInfo getWindowsConnectionInfo(ConnectionInfo info) const {
+    if (!contextInitialized) {
+      info.tls_error = "TLS context not initialized";
+      return info;
+    }
+
+    try {
+      SecPkgContext_CipherInfo cipherInfo;
+      SECURITY_STATUS status = QueryContextAttributes(
+        const_cast<CtxtHandle*>(&context),
+        SECPKG_ATTR_CIPHER_INFO,
+        &cipherInfo
+      );
+
+      if (status == SEC_E_OK) {
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+        info.tls_cipher = converter.to_bytes(cipherInfo.szCipherSuite);
+        info.tls_bits = static_cast<int>(cipherInfo.dwCipherLen);
+      }
+
+      SecPkgContext_ConnectionInfo connInfo;
+      status = QueryContextAttributes(
+        const_cast<CtxtHandle*>(&context),
+        SECPKG_ATTR_CONNECTION_INFO,
+        &connInfo
+      );
+
+      if (status == SEC_E_OK) {
+        switch (connInfo.dwProtocol) {
+          case SP_PROT_TLS1_2_CLIENT:
+            info.tls_version = "TLSv1.2";
+            break;
+          case SP_PROT_TLS1_3_CLIENT:
+            info.tls_version = "TLSv1.3";
+            break;
+          default:
+            info.tls_version = "Unknown";
+            break;
+        }
+      }
+
+      PCCERT_CONTEXT certContext = nullptr;
+      status = QueryContextAttributes(
+        const_cast<CtxtHandle*>(&context),
+        SECPKG_ATTR_REMOTE_CERT_CONTEXT,
+        (void*)&certContext
+      );
+
+      if (status == SEC_E_OK && certContext) {
+        char cn[256];
+        DWORD cnSize = sizeof(cn);
+
+        if (CertGetNameStringA(
+          certContext,
+          CERT_NAME_SIMPLE_DISPLAY_TYPE,
+          0,
+          nullptr,
+          cn,
+          cnSize
+        ) > 1) {
+          info.server_cert_cn = cn;
+          info.server_cert_valid = true;
+        }
+
+        CertFreeCertificateContext(certContext);
+      }
+    } catch (const std::exception& e) {
+      info.tls_error = std::string("TLS info error: ") + e.what();
+    }
+
+    return info;
+  }
+#else
+  ConnectionInfo getOpenSSLConnectionInfo(ConnectionInfo info) const {
+    if (!ssl) {
+      info.tls_error = "SSL not initialized";
+      return info;
+    }
+
+    try {
+      const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl);
+      if (cipher) {
+        info.tls_cipher = SSL_CIPHER_get_name(cipher);
+        info.tls_bits = SSL_CIPHER_get_bits(cipher, nullptr);
+      }
+
+      const char* version = SSL_get_version(ssl);
+      if (version) {
+        info.tls_version = version;
+      }
+
+      X509* cert = SSL_get_peer_certificate(ssl);
+      if (cert) {
+        info.server_cert_valid = true;
+
+        X509_NAME* subject = X509_get_subject_name(cert);
+        if (subject) {
+          char cn_buff[256];
+          int len = X509_NAME_get_text_by_NID(subject, NID_commonName, cn_buf, sizeof(cn_buf));
+          if (len > 0) {
+            info.server_cert_cn = std::string(cn_buf, len);
+          }
+        }
+
+        X509_free(cert);
+      }
+
+      long verify_result = SSL_get_verify_result(ssl);
+      if (verify_result != X509_V_OK) {
+        info.server_cert_valid = false;
+        info.tls_error = "Certificate verification failed: " +
+                        std::string(X509_verify_cert_error_string(verify_result));
+      }
+    } catch (const std::exception& e) {
+      info.tls_error = std::string("OpenSSL info error: ") + e.what();
+    }
+
+    return info;
+  }
+#endif
+
+private:
+  bool performTLSHandshake(const std::string& host) {
+#ifdef _WIN32
+    return performWindowsTLSHandshake(host);
+#else
+    return performOpenSSLHandshake(host);
+#endif
+  }
+
+#ifdef _WIN32
+  bool performWindowsTLSHandshake(const std::string& host) {
+    // Initialize Schannel credentials
+    SCHANNEL_CRED credData{};
+    credData.dwVersion = SCHANNEL_CRED_VERSION;
+    credData.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION;
+
+    SECURITY_STATUS status = AcquireCredentialsHandle(
+      nullptr, const_cast<SEC_CHAR*>(UNISP_NAME), SECPKG_CRED_OUTBOUND,
+      nullptr, &credData, nullptr, nullptr, &credentials, nullptr
+    );
+
+    if (status != SEC_E_OK) return false;
+    credentialsInitialized = true;
+
+    // Perform handshake
+    SecBuffer outBuffers[1];
+    SecBufferDesc outBufferDesc;
+    outBuffers[0].pvBuffer = nullptr;
+    outBuffers[0].BufferType = SECBUFFER_TOKEN;
+    outBuffers[0].cbBuffer = 0;
+    outBufferDesc.cBuffers = 1;
+    outBufferDesc.pBuffers = outBuffers;
+    outBufferDesc.ulVersion = SECBUFFER_VERSION;
+
+    DWORD contextAttributes;
+    status = InitializeSecurityContext(
+      &credentials, nullptr, const_cast<SEC_CHAR*>(host.c_str()),
+      ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY |
+      ISC_REQ_EXTENDED_ERROR | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM,
+      0, SECURITY_NATIVE_DREP, nullptr, 0, &context, &outBufferDesc,
+      &contextAttributes, nullptr
+    );
+
+    if (status != SEC_I_CONTINUE_NEEDED && status != SEC_E_OK) {
+      return false;
+    }
+
+    contextInitialized = true;
+
+    // Send initial handshake data
+    if (outBuffers[0].cbBuffer > 0) {
+      ::send(socket, static_cast<char*>(outBuffers[0].pvBuffer),
+        outBuffers[0].cbBuffer, 0);
+      FreeContextBuffer(outBuffers[0].pvBuffer);
+    }
+
+    // Continue handshake until complete
+    return completeWindowsHandshake();
+  }
+
+  bool completeWindowsHandshake() {
+    std::vector<char> buffer(8192);
+
+    while (true) {
+      ssize_t received = ::recv(socket, buffer.data(), buffer.size(), 0);
+      if (received <= 0) return false;
+
+      SecBuffer inBuffers[2];
+      SecBuffer outBuffers[1];
+      SecBufferDesc inBufferDesc, outBufferDesc;
+
+      inBuffers[0].pvBuffer = buffer.data();
+      inBuffers[0].cbBuffer = static_cast<unsigned long>(received);
+      inBuffers[0].BufferType = SECBUFFER_TOKEN;
+      inBuffers[1].pvBuffer = nullptr;
+      inBuffers[1].cbBuffer = 0;
+      inBuffers[1].BufferType = SECBUFFER_EMPTY;
+      inBufferDesc.cBuffers = 2;
+      inBufferDesc.pBuffers = inBuffers;
+      inBufferDesc.ulVersion = SECBUFFER_VERSION;
+
+      outBuffers[0].pvBuffer = nullptr;
+      outBuffers[0].BufferType = SECBUFFER_TOKEN;
+      outBuffers[0].cbBuffer = 0;
+      outBufferDesc.cBuffers = 1;
+      outBufferDesc.pBuffers = outBuffers;
+      outBufferDesc.ulVersion = SECBUFFER_VERSION;
+
+      DWORD contextAttributes;
+      SECURITY_STATUS status = InitializeSecurityContext(
+        &credentials, &context, nullptr,
+        ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY |
+        ISC_REQ_EXTENDED_ERROR | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM,
+        0, SECURITY_NATIVE_DREP, &inBufferDesc, 0, nullptr, &outBufferDesc,
+        &contextAttributes, nullptr
+      );
+
+      if (status == SEC_E_OK) {
+        if (outBuffers[0].cbBuffer > 0) {
+          ::send(socket, static_cast<char*>(outBuffers[0].pvBuffer),
+            outBuffers[0].cbBuffer, 0);
+          FreeContextBuffer(outBuffers[0].pvBuffer);
+        }
+        return true; // Handshake complete
+      } else if (status == SEC_I_CONTINUE_NEEDED) {
+        if (outBuffers[0].cbBuffer > 0) {
+          ::send(socket, static_cast<char*>(outBuffers[0].pvBuffer),
+            outBuffers[0].cbBuffer, 0);
+        }
+        continue;
+      } else {
+        return false;
+      }
+    }
+  }
+
+  ssize_t sendWindows(const void* data, size_t len) {
+    SecPkgContext_StreamSizes sizes;
+    SECURITY_STATUS status = QueryContextAttributes(&context, SECPKG_ATTR_STREAM_SIZES, &sizes);
+    if (status != SEC_E_OK) return -1;
+
+    size_t totalSent = 0;
+    const char* dataPtr = static_cast<const char*>(data);
+
+    while (totalSent < len) {
+      size_t chunkSize = std::min(len - totalSent, static_cast<size_t>(sizes.cbMaximumMessage));
+
+      SecBuffer buffers[4];
+      buffers[0].pvBuffer = writeBuffer.data();
+      buffers[0].cbBuffer = sizes.cbHeader;
+      buffers[0].BufferType = SECBUFFER_STREAM_HEADER;
+
+      buffers[1].pvBuffer = writeBuffer.data() + sizes.cbHeader;
+      buffers[1].cbBuffer = static_cast<unsigned long>(chunkSize);
+      buffers[1].BufferType = SECBUFFER_DATA;
+      memcpy(buffers[1].pvBuffer, dataPtr + totalSent, chunkSize);
+
+      buffers[2].pvBuffer = writeBuffer.data() + sizes.cbHeader + chunkSize;
+      buffers[2].cbBuffer = sizes.cbTrailer;
+      buffers[2].BufferType = SECBUFFER_STREAM_TRAILER;
+
+      buffers[3].pvBuffer = nullptr;
+      buffers[3].cbBuffer = 0;
+      buffers[3].BufferType = SECBUFFER_EMPTY;
+
+      SecBufferDesc bufferDesc;
+      bufferDesc.ulVersion = SECBUFFER_VERSION;
+      bufferDesc.cBuffers = 4;
+      bufferDesc.pBuffers = buffers;
+
+      status = EncryptMessage(&context, 0, &bufferDesc, 0);
+      if (status != SEC_E_OK) return -1;
+
+      size_t totalBytes = buffers[0].cbBuffer + buffers[1].cbBuffer + buffers[2].cbBuffer;
+      ssize_t sent = ::send(socket, writeBuffer.data(), totalBytes, 0);
+      if (sent != static_cast<ssize_t>(totalBytes)) return -1;
+
+      totalSent += chunkSize;
+    }
+
+    return static_cast<ssize_t>(totalSent);
+  }
+
+  ssize_t recvWindows(void* data, size_t len) {
+    //std::cout << "recvWindows called\n";
+    static std::vector<char> decryptBuffer;
+    static size_t decryptBufferUsed = 0;
+
+    if (decryptBuffer.empty()) {
+        decryptBuffer.resize(16384);
+        //std::cout << "[DEBUG] decryptBuffer initialized to 16384 bytes\n";
+    }
+
+    // We need to check if /exit was called
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(socket, &readSet);
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100 * 1000; // 100ms timeout
+
+    int result = select(socket + 1, &readSet, nullptr, nullptr, &timeout);
+    if (result < 0) {
+      perror("[ERROR] select failed");
+      return -1;
+    }
+    if (result == 0) {
+      //std::cout << "[DEBUG] select timed out (no data)\n";
+#ifdef _WIN32
+      WSASetLastError(WSAEWOULDBLOCK);
+#else
+      errno = EAGAIN;
+#endif
+      return -1;
+    }
+
+    ssize_t received = ::recv(socket, readBuffer.data(), readBuffer.size(), 0);
+    if (received <= 0) {
+      //std::cout << "[DEBUG] recv returned" << received;
+      return received;
+    }
+    //std::cout << "[DEBUG] Received" << received << " bytes from socket\n";
+
+    SecBuffer buffers[4];
+    buffers[0].pvBuffer = readBuffer.data();
+    buffers[0].cbBuffer = static_cast<unsigned long>(received);
+    buffers[0].BufferType = SECBUFFER_DATA;
+
+    for (int i = 1; i < 4; ++i) {
+      buffers[i].BufferType = SECBUFFER_EMPTY;
+      buffers[i].pvBuffer = nullptr;
+      buffers[i].cbBuffer = 0;
+    }
+
+    SecBufferDesc bufferDesc;
+    bufferDesc.ulVersion = SECBUFFER_VERSION;
+    bufferDesc.cBuffers = 4;
+    bufferDesc.pBuffers = buffers;
+
+    SECURITY_STATUS status = DecryptMessage(&context, &bufferDesc, 0, nullptr);
+    if (status != SEC_E_OK) {
+      std::cerr << "[ERROR] DecryptMessage failed: " << status << "\n";
+      return -1;
+    }
+
+    for (int i = 0; i < 4; i++) {
+      //printf("[DEBUG] Buffer[%d]: type=%lu, size=%lu\n", i, buffers[i].BufferType, buffers[i].cbBuffer);
+      if (buffers[i].BufferType == SECBUFFER_DATA && buffers[i].cbBuffer > 0) {
+        size_t copySize = std::min(len, static_cast<size_t>(buffers[i].cbBuffer));
+        memcpy(data, buffers[i].pvBuffer, copySize);
+        //printf("[DEBUG] Copied %zu bytes of decrypted data to output buffer\n", copySize);
+        return static_cast<ssize_t>(copySize);
+      }
+    }
+
+    //std::cout << "[DEBUG] No decrypted data found in buffers\n";
+    return 0;
+  }
+
+#else
+  bool performOpenSSLHandshake(const std::string& host) {
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return false;
+
+    // Configure SSL context
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+    if (!VERIFY_TLS_CERTIFICATE) {
+      SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    }
+
+    ssl = SSL_new(ctx);
+    if (!ssl) return false;
+
+    if (SSL_set_fd(ssl, socket) != 1) return false;
+
+    // Set SNI
+    SSL_set_tlsext_host_name(ssl, host.c_str());
+
+    // Perform handshake with timeout
+    SSL_set_connect_state(ssl);
+
+    // Set non-blocking for timeout
+    if (!setNonBlocking(socket)) return false;
+
+    int result;
+    time_t startTime = time(nullptr);
+
+    while (true) {
+      result = SSL_connect(ssl);
+      if (result == 1) break; // Success
+
+      int error = SSL_get_error(ssl, result);
+      if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+        if (time(nullptr) - startTime > TLS_HANDSHAKE_TIMEOUT_MS / 1000) {
+          return false; // Timeout
+        }
+        sleep_ms(10);
+        continue;
+      } else {
+        return false; // Other error
+      }
+    }
+
+    // Set back to blocking
+    if (!setBlocking(socket)) return false;
+
+    return true;
+  }
+#endif
+
+};
+
 /**
  * @brief RAII wrapper for WinSock initialization
  * 
@@ -525,7 +1179,7 @@ public:
    * @param host Server hostname or IP address
    * @param port Server port number
    */
-  EasyGameChat(const std::string& host, int port);
+  EasyGameChat(const std::string& host, int port, bool useTLS = true);
 
   /**
    * @brief Destructor - automatically disconnects and cleans up
@@ -596,6 +1250,8 @@ public:
    */
   void disconnect();
 
+  ConnectionInfo getConnectionInfo() const;
+
 private:
   /**
    * @brief Background thread function for receiving messages
@@ -631,6 +1287,8 @@ private:
    */
   bool connectWithTimeout(int sock, const sockaddr* addr, socklen_t addrlen, int timeout_ms);
 
+  bool connectWithTLS(const std::string& host, int port);
+
   // Member variables
   std::string _host;                    // Server hostname/IP
   int _port;                            // Server port number
@@ -642,6 +1300,11 @@ private:
   MessageCallback _callback;            // User-provided message callback
   std::mutex _callbackMutex;            // Protects callback access
   WinSockInitializer _winsockInit;      // RAII WinSock initialization
+
+  // We will probably replace the old socket management with TLS or keep it for legacy support...?
+  std::unique_ptr<TLSSocket> _tlsSocket;
+  bool _useTLS;
+  TLSInitializer _tlsInit;
   
   // Rate limiting members
   std::chrono::steady_clock::time_point _lastSendTime;  // Timestamp of last message sent
@@ -651,8 +1314,12 @@ private:
 
 // Implementation 
 
-EasyGameChat::EasyGameChat(const std::string& host, int port)
-  : _host(host), _port(port), _lastSendTime(std::chrono::steady_clock::now()) {}
+EasyGameChat::EasyGameChat(const std::string& host, int port, bool useTLS)
+  : _host(host), _port(port), _useTLS(useTLS), _lastSendTime(std::chrono::steady_clock::now()) {
+  if (_useTLS) {
+    _tlsSocket = std::make_unique<TLSSocket>();
+  }
+}
 
 EasyGameChat::~EasyGameChat() { 
   disconnect(); 
@@ -717,49 +1384,64 @@ bool EasyGameChat::connect(const std::string& nickname) {
     return false;
   }
 
-  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (sock < 0) {
-    return false;
-  }
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(_port));
-
-#ifdef _WIN32
-  if (InetPtonA(AF_INET, _host.c_str(), &addr.sin_addr) != 1) {
-    closesocket_x(sock);
-    return false;
-  }
-#else
-  if (inet_pton(AF_INET, _host.c_str(), &addr.sin_addr) <= 0) {
-    closesocket_x(sock);
-    return false;
-  }
-#endif
-
-  if (!connectWithTimeout(sock, (sockaddr*)&addr, sizeof(addr), CONNECT_TIMEOUT_MS)) {
-    closesocket_x(sock);
-    return false;
-  }
-
-  if (!setNonBlocking(sock)) {
-    closesocket_x(sock);
-    return false;
-  }
-
-  _sock.store(sock);
   _nickname = nickname;
 
-  // Send nickname with secure JSON
   nlohmann::json j;
   j["from"] = "Client";
   j["text"] = nickname;
-  
-  if (!sendJson(j)) {
-    closesocket_x(sock);
-    _sock.store(-1);
-    return false;
+
+  bool connected = false;
+
+  if (_useTLS) {
+    connected = _tlsSocket->connect(_host, _port);
+    if (connected) {
+      _sock.store(_tlsSocket->getSocket());
+      if (!sendJson(j)) {
+        _tlsSocket->disconnect();
+        _sock.store(-1);
+        return false;
+      }
+    }
+  }
+  else {
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+      return false;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(_port));
+
+#ifdef _WIN32
+    if (InetPtonA(AF_INET, _host.c_str(), &addr.sin_addr) != 1) {
+      closesocket_x(sock);
+      return false;
+    }
+#else
+    if (inet_pton(AF_INET, _host.c_str(), &addr.sin_addr) <= 0) {
+      closesocket_x(sock);
+      return false;
+    }
+#endif
+
+    if (!connectWithTimeout(sock, (sockaddr*)&addr, sizeof(addr), CONNECT_TIMEOUT_MS)) {
+      closesocket_x(sock);
+      return false;
+    }
+
+    if (!setNonBlocking(sock)) {
+      closesocket_x(sock);
+      return false;
+    }
+
+    _sock.store(sock);
+
+    if (!sendJson(j)) {
+      closesocket_x(sock);
+      _sock.store(-1);
+      return false;
+    }
   }
 
   _shouldStop.store(false);
@@ -769,8 +1451,7 @@ bool EasyGameChat::connect(const std::string& nickname) {
 }
 
 bool EasyGameChat::sendJson(const nlohmann::json& j) {
-  int sock = _sock.load();
-  if (sock < 0) return false;
+  if (_sock.load() < 0) return false;
   
   try {
     std::string jsonStr = j.dump();
@@ -782,63 +1463,50 @@ bool EasyGameChat::sendJson(const nlohmann::json& j) {
     
     jsonStr += "\n";
     
-    size_t totalSent = 0;
-    int retries = 0;
-    const int maxRetries = 10;
-    
-    while (totalSent < jsonStr.size() && retries < maxRetries) {
-      ssize_t sent = ::send(sock, jsonStr.c_str() + totalSent, 
-                           jsonStr.size() - totalSent, 0);
-      if (sent < 0) {
-#ifdef _WIN32
-        int err = WSAGetLastError();
-        if (err == WSAEWOULDBLOCK) {
-#else
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-#endif
-          sleep_ms(10);
-          retries++;
-          continue;
-        }
-        return false;
-      }
-      totalSent += static_cast<size_t>(sent);
-      retries = 0; // Reset retries on successful send
+    ssize_t sent;
+
+    if (_useTLS && _tlsSocket) {
+      sent = _tlsSocket->send(jsonStr.c_str(), jsonStr.size());
+    } else {
+      sent = ::send(_sock.load(), jsonStr.c_str(), jsonStr.size(), 0);
     }
-    
-    return totalSent == jsonStr.size();
+
+    return sent == static_cast<ssize_t>(jsonStr.size());
   } catch (const std::exception&) {
     return false;
   }
 }
 
 void EasyGameChat::recvLoop() {
+  //std::cout << "[DEBUG] STARTING recvLoop\n";
   std::vector<char> buffer(MAX_BUFFER_SIZE);
   std::string leftover;
   leftover.reserve(MAX_BUFFER_SIZE);
 
   while (_running.load() && !_shouldStop.load()) {
-    int sock = _sock.load();
-    if (sock < 0) break;
-    
-    // Use select for timeout
-    fd_set readSet;
-    FD_ZERO(&readSet);
-    FD_SET(sock, &readSet);
-    
-    struct timeval timeout;
-    timeout.tv_sec = 0;
-    timeout.tv_usec = RECV_TIMEOUT_MS * 1000;
-    
-    int selectResult = select(sock + 1, &readSet, nullptr, nullptr, &timeout);
-    if (selectResult < 0) {
-      break; // Error
-    } else if (selectResult == 0) {
-      continue; // Timeout, check if we should stop
+    if (_sock.load() < 0) break;
+
+    ssize_t received;
+
+    if (_useTLS && _tlsSocket) {
+      //std::cout << "[DEBUG] about to call TLS recv called\n";
+      received = _tlsSocket->recv(buffer.data(), buffer.size() - 1);
+      //std::cout << "[DEBUG] TLS recv returned " << received << "\n";
+    } else {
+      fd_set readSet;
+      FD_ZERO(&readSet);
+      FD_SET(_sock.load(), &readSet);
+
+      struct timeval timeout;
+      timeout.tv_sec = 0;
+      timeout.tv_usec = RECV_TIMEOUT_MS * 1000;
+
+      int selectResult = select(_sock.load() + 1, &readSet, nullptr, nullptr, &timeout);
+      if (selectResult < 0) continue;
+
+      ssize_t received = recv(_sock.load(), buffer.data(), buffer.size() - 1, 0);
     }
-    
-    ssize_t received = recv(sock, buffer.data(), buffer.size() - 1, 0);
-    
+
     if (received > 0) {
       buffer[received] = '\0';
 
@@ -885,7 +1553,7 @@ void EasyGameChat::recvLoop() {
               std::string from = j["from"];
               std::string text = j["text"];
               
-              // Double-validate (first this had isValidNickname, but it's getting the server filtered. It will probably need a better solution later.)
+              // Double-validate (first this had isValidNickname, but it's getting the server filtered. This will probably need a better solution later.)
               if (/* isValidNickname(from) &&  */isValidMessage(text)) {
                 std::lock_guard<std::mutex> lock(_callbackMutex);
                 if (_callback) {
@@ -900,10 +1568,10 @@ void EasyGameChat::recvLoop() {
       }
     }
     else if (received == 0) {
+      std::cout << "Received 0, connection closed.\n";
       break; // Connection closed
     }
     else {
-      // received < 0
 #ifdef _WIN32
       int err = WSAGetLastError();
       if (err != WSAEWOULDBLOCK) {
@@ -958,12 +1626,38 @@ void EasyGameChat::disconnect() {
     if (_recvThread.joinable()) {
       _recvThread.join();
     }
-    
-    int sock = _sock.exchange(-1);
-    if (sock >= 0) {
-      closesocket_x(sock);
+
+    if (_useTLS && _tlsSocket) {
+      _tlsSocket->disconnect();
+    } else {
+      int sock = _sock.exchange(-1);
+      if (sock >= 0) {
+        closesocket_x(sock);
+      }
+    }
+
+    _sock.store(-1);
+  }
+}
+
+ConnectionInfo EasyGameChat::getConnectionInfo() const {
+  ConnectionInfo info;
+
+  info.connected = _running.load();
+  info.host = _host;
+  info.port = _port;
+  info.nickname = _nickname;
+  info.tls_enabled = _useTLS;
+
+  if (_useTLS && _tlsSocket && _running.load()) {
+    try {
+      info = _tlsSocket->getConnectionInfo(info);
+    } catch (const std::exception& e) {
+      info.tls_error = e.what();
     }
   }
+
+  return info;
 }
 
 } // namespace egc
@@ -1056,6 +1750,48 @@ void egc_destroy(egc_client_t* client) {
   delete client->callback_mutex;
   delete client->valid;
   free(client);
+}
+
+bool egc_get_connection_info(egc_client_t* client, egc_connection_info_t* info) {
+  if (!client || !client->cpp_client || !info || !client->valid->load()) {
+    return false;
+  }
+
+  try {
+    auto cpp_info = client->cpp_client->getConnectionInfo();
+
+    // Copy data to struct
+    info->connected = cpp_info.connected;
+    strncpy(info->host, cpp_info.host.c_str(), sizeof(info->host) - 1);
+    info->host[sizeof(info->host) - 1] = '\0';
+    
+    info->port = cpp_info.port;
+    
+    strncpy(info->nickname, cpp_info.nickname.c_str(), sizeof(info->nickname) - 1);
+    info->nickname[sizeof(info->nickname) - 1] = '\0';
+    
+    info->tls_enabled = cpp_info.tls_enabled;
+    
+    strncpy(info->tls_cipher, cpp_info.tls_cipher.c_str(), sizeof(info->tls_cipher) - 1);
+    info->tls_cipher[sizeof(info->tls_cipher) - 1] = '\0';
+    
+    strncpy(info->tls_version, cpp_info.tls_version.c_str(), sizeof(info->tls_version) - 1);
+    info->tls_version[sizeof(info->tls_version) - 1] = '\0';
+    
+    info->tls_bits = cpp_info.tls_bits;
+    
+    strncpy(info->server_cert_cn, cpp_info.server_cert_cn.c_str(), sizeof(info->server_cert_cn) - 1);
+    info->server_cert_cn[sizeof(info->server_cert_cn) - 1] = '\0';
+    
+    info->server_cert_valid = cpp_info.server_cert_valid;
+    
+    strncpy(info->tls_error, cpp_info.tls_error.c_str(), sizeof(info->tls_error) - 1);
+    info->tls_error[sizeof(info->tls_error) - 1] = '\0';
+
+    return true;
+  } catch (...) {
+    return false;
+  }
 }
 
 } // extern "C"

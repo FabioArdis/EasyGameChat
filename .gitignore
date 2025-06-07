@@ -60,3 +60,7 @@ Thumbs.db
 # Examples
 examples/c-cpp/build/
 examples/c-cpp/chat_client.exe
+
+# TLS
+*.crt
+*.key
