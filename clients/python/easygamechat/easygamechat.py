@@ -404,6 +404,10 @@ class EasyGameChat:
         """Close all socket connections"""
         if self.tls_socket:
             try:
+                self.tls_socket.unwrap()
+            except:
+                pass
+            try:
                 self.tls_socket.close()
             except:
                 pass

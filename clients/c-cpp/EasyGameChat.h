@@ -42,6 +42,8 @@
   #include <sspi.h>
   #pragma comment(lib, "secur32.lib")
   #pragma comment(lib, "crypt32.lib")
+  #include <locale>
+  #include <codecvt>
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -66,6 +68,20 @@ extern "C" {
 #endif
 
 // --- C API ---
+
+typedef struct {
+  bool connected;
+  char host[256];
+  int port;
+  char nickname[64];
+  bool tls_enabled;
+  char tls_cipher[128];
+  char tls_version[32];
+  int tls_bits;
+  char server_cert_cn[256];
+  bool server_cert_valid;
+  char tls_error[512];
+} egc_connection_info_t;
 
 /**
  * @brief Callback function type for receiving chat messages
@@ -200,6 +216,8 @@ void egc_poll(egc_client_t* client);
  */
 void egc_destroy(egc_client_t* client);
 
+bool egc_get_connection_info(egc_client_t* client, egc_connection_info_t* info);
+
 #ifdef __cplusplus
 }
 #endif
@@ -226,6 +244,25 @@ void egc_destroy(egc_client_t* client);
  * functions are contained within this namespace.
  */
 namespace egc {
+
+struct ConnectionInfo {
+  bool connected;
+  std::string host;
+  int port;
+  std::string nickname;
+  bool tls_enabled;
+
+  // TLS-specific fields
+  std::string tls_cipher;
+  std::string tls_version;
+  int tls_bits;
+  std::string server_cert_cn;
+  bool server_cert_valid;
+  std::string tls_error;
+
+  ConnectionInfo() : connected(false), port(0), tls_enabled(false),
+                     tls_bits(0), server_cert_valid(false) {}
+};
 
 // Security-focused constants
 
@@ -634,6 +671,141 @@ public:
 
   bool isConnected() const { return connected; }
   int getSocket() const { return socket; }
+
+  ConnectionInfo getConnectionInfo(ConnectionInfo info) const {
+    if (!connected) {
+      info.tls_error = "Not connected";
+      return info;
+    }
+
+#ifdef _WIN32
+    return getWindowsConnectionInfo(info);
+#else
+    return getOpenSSLConnectionInfo(info);
+#endif
+  }
+
+#ifdef _WIN32
+  ConnectionInfo getWindowsConnectionInfo(ConnectionInfo info) const {
+    if (!contextInitialized) {
+      info.tls_error = "TLS context not initialized";
+      return info;
+    }
+
+    try {
+      SecPkgContext_CipherInfo cipherInfo;
+      SECURITY_STATUS status = QueryContextAttributes(
+        const_cast<CtxtHandle*>(&context),
+        SECPKG_ATTR_CIPHER_INFO,
+        &cipherInfo
+      );
+
+      if (status == SEC_E_OK) {
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+        info.tls_cipher = converter.to_bytes(cipherInfo.szCipherSuite);
+        info.tls_bits = static_cast<int>(cipherInfo.dwCipherLen);
+      }
+
+      SecPkgContext_ConnectionInfo connInfo;
+      status = QueryContextAttributes(
+        const_cast<CtxtHandle*>(&context),
+        SECPKG_ATTR_CONNECTION_INFO,
+        &connInfo
+      );
+
+      if (status == SEC_E_OK) {
+        switch (connInfo.dwProtocol) {
+          case SP_PROT_TLS1_2_CLIENT:
+            info.tls_version = "TLSv1.2";
+            break;
+          case SP_PROT_TLS1_3_CLIENT:
+            info.tls_version = "TLSv1.3";
+            break;
+          default:
+            info.tls_version = "Unknown";
+            break;
+        }
+      }
+
+      PCCERT_CONTEXT certContext = nullptr;
+      status = QueryContextAttributes(
+        const_cast<CtxtHandle*>(&context),
+        SECPKG_ATTR_REMOTE_CERT_CONTEXT,
+        (void*)&certContext
+      );
+
+      if (status == SEC_E_OK && certContext) {
+        char cn[256];
+        DWORD cnSize = sizeof(cn);
+
+        if (CertGetNameStringA(
+          certContext,
+          CERT_NAME_SIMPLE_DISPLAY_TYPE,
+          0,
+          nullptr,
+          cn,
+          cnSize
+        ) > 1) {
+          info.server_cert_cn = cn;
+          info.server_cert_valid = true;
+        }
+
+        CertFreeCertificateContext(certContext);
+      }
+    } catch (const std::exception& e) {
+      info.tls_error = std::string("TLS info error: ") + e.what();
+    }
+
+    return info;
+  }
+#else
+  ConnectionInfo getOpenSSLConnectionInfo(ConnectionInfo info) const {
+    if (!ssl) {
+      info.tls_error = "SSL not initialized";
+      return info;
+    }
+
+    try {
+      const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl);
+      if (cipher) {
+        info.tls_cipher = SSL_CIPHER_get_name(cipher);
+        info.tls_bits = SSL_CIPHER_get_bits(cipher, nullptr);
+      }
+
+      const char* version = SSL_get_version(ssl);
+      if (version) {
+        info.tls_version = version;
+      }
+
+      X509* cert = SSL_get_peer_certificate(ssl);
+      if (cert) {
+        info.server_cert_valid = true;
+
+        X509_NAME* subject = X509_get_subject_name(cert);
+        if (subject) {
+          char cn_buff[256];
+          int len = X509_NAME_get_text_by_NID(subject, NID_commonName, cn_buf, sizeof(cn_buf));
+          if (len > 0) {
+            info.server_cert_cn = std::string(cn_buf, len);
+          }
+        }
+
+        X509_free(cert);
+      }
+
+      long verify_result = SSL_get_verify_result(ssl);
+      if (verify_result != X509_V_OK) {
+        info.server_cert_valid = false;
+        info.tls_error = "Certificate verification failed: " +
+                        std::string(X509_verify_cert_error_string(verify_result));
+      }
+    } catch (const std::exception& e) {
+      info.tls_error = std::string("OpenSSL info error: ") + e.what();
+    }
+
+    return info;
+  }
+#endif
 
 private:
   bool performTLSHandshake(const std::string& host) {
@@ -1078,6 +1250,8 @@ public:
    */
   void disconnect();
 
+  ConnectionInfo getConnectionInfo() const;
+
 private:
   /**
    * @brief Background thread function for receiving messages
@@ -1466,6 +1640,26 @@ void EasyGameChat::disconnect() {
   }
 }
 
+ConnectionInfo EasyGameChat::getConnectionInfo() const {
+  ConnectionInfo info;
+
+  info.connected = _running.load();
+  info.host = _host;
+  info.port = _port;
+  info.nickname = _nickname;
+  info.tls_enabled = _useTLS;
+
+  if (_useTLS && _tlsSocket && _running.load()) {
+    try {
+      info = _tlsSocket->getConnectionInfo(info);
+    } catch (const std::exception& e) {
+      info.tls_error = e.what();
+    }
+  }
+
+  return info;
+}
+
 } // namespace egc
 
 // C API Implementation
@@ -1556,6 +1750,48 @@ void egc_destroy(egc_client_t* client) {
   delete client->callback_mutex;
   delete client->valid;
   free(client);
+}
+
+bool egc_get_connection_info(egc_client_t* client, egc_connection_info_t* info) {
+  if (!client || !client->cpp_client || !info || !client->valid->load()) {
+    return false;
+  }
+
+  try {
+    auto cpp_info = client->cpp_client->getConnectionInfo();
+
+    // Copy data to struct
+    info->connected = cpp_info.connected;
+    strncpy(info->host, cpp_info.host.c_str(), sizeof(info->host) - 1);
+    info->host[sizeof(info->host) - 1] = '\0';
+    
+    info->port = cpp_info.port;
+    
+    strncpy(info->nickname, cpp_info.nickname.c_str(), sizeof(info->nickname) - 1);
+    info->nickname[sizeof(info->nickname) - 1] = '\0';
+    
+    info->tls_enabled = cpp_info.tls_enabled;
+    
+    strncpy(info->tls_cipher, cpp_info.tls_cipher.c_str(), sizeof(info->tls_cipher) - 1);
+    info->tls_cipher[sizeof(info->tls_cipher) - 1] = '\0';
+    
+    strncpy(info->tls_version, cpp_info.tls_version.c_str(), sizeof(info->tls_version) - 1);
+    info->tls_version[sizeof(info->tls_version) - 1] = '\0';
+    
+    info->tls_bits = cpp_info.tls_bits;
+    
+    strncpy(info->server_cert_cn, cpp_info.server_cert_cn.c_str(), sizeof(info->server_cert_cn) - 1);
+    info->server_cert_cn[sizeof(info->server_cert_cn) - 1] = '\0';
+    
+    info->server_cert_valid = cpp_info.server_cert_valid;
+    
+    strncpy(info->tls_error, cpp_info.tls_error.c_str(), sizeof(info->tls_error) - 1);
+    info->tls_error[sizeof(info->tls_error) - 1] = '\0';
+
+    return true;
+  } catch (...) {
+    return false;
+  }
 }
 
 } // extern "C"
