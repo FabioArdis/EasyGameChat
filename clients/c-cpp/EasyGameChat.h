@@ -53,7 +53,7 @@
   #include <string.h>
   #include <time.h>
   #include <sys/select.h>
-  #include <openssl/ssl.s>
+  #include <openssl/ssl.h>
   #include <openssl/err.h>
   #include <openssl/bio.h>
   #include <openssl/x509v3.h>
@@ -75,7 +75,7 @@ extern "C" {
  * receive thread.
  * 
  * @param from The nickname of the message sender (null-terminated string)
- * @param text The message content (null-terminated string)
+* @param text The message content (null-terminated string)
  * @param user_data User-provided data pointer passed to egc_set_message_callback
  * 
  * @note The strings pointed to by 'from' and 'text' are only valid during
@@ -566,7 +566,25 @@ public:
 #ifdef _WIN32
     return recvWindows(data, len);
 #else
-    return SSL_read(ssl, data, static_cast<int>(len));
+    int fd = SSL_get_fd(ssl);
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(fd, &readfds);
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = RECV_TIMEOUT_MS * 1000;
+
+    int ready = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
+
+    if (ready > 0) {
+      return SSL_read(ssl, data, static_cast<int>(len));
+    } else if (ready == 0) {
+      errno = EAGAIN;
+      return -1; // Timeout
+    } else {
+      return -1; // Error
+    }
 #endif
   }
 
@@ -1376,6 +1394,7 @@ void EasyGameChat::recvLoop() {
       }
     }
     else if (received == 0) {
+      std::cout << "Received 0, connection closed.\n";
       break; // Connection closed
     }
     else {

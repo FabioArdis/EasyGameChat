@@ -45,7 +45,7 @@ int main() {
     if (input == "/exit") break;
     egc_send(client, input.c_str());
   }
-
+  
   egc_destroy(client);
   std::cout << "Disconnected.\n";
   return 0;
