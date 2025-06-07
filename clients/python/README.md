@@ -47,7 +47,7 @@ cmake --build build
 ```bash
 cd clients/python
 python -m build
-python -m pip install .\dist\easy_game_chat-0.1.0-py3-none-any.whl
+python -m pip install .\dist\easy_game_chat-0.2.0-py3-none-any.whl
 # or install directly from the source
 pip install .
 python examples/python/main.py

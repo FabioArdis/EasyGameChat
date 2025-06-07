@@ -17,7 +17,7 @@
  * - Memory-safe C API wrapper
  * 
  * @author Fabio Ardis
- * @version 0.1.0
+ * @version 0.2.0
  * @date 2025-06-02
  */
 
