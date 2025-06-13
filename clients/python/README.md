@@ -10,6 +10,7 @@
 ## Features
 
 * Lightweight and efficient server implementation in Go
+* TLS encryption for secure communication
 * Secure and strict input validation
 * Modular server-client architecture
 * Cross-language support (C++, Python, and more to come)
@@ -21,16 +22,19 @@
 ### Server (Go)
 
 1. Install Go 1.18 or later.
-2. Run the server:
+2. Generate a TLS certificte and key with the provided scripts or, preferably, use your own. The server requires a valid certificate and key for secure communication.
+3. Run the server:
 
 ```bash
 go run main.go
 ```
 
+> TLS is enabled by default. You can configure certificate paths or disable TLS in the config file or server options.
+
 ### Client (C++)
 
 1. Include `EasyGameChat.h` in your project.
-2. Install the required dependencies (only `nlohmann/json` for JSON parsing, for now) with your preferred package manager. On Windows, you can specify your preferred toolchain in the CMake build command with `-DCMAKE_TOOLCHAIN_FILE=path/to/your/toolchain.cmake`.
+2. Install the required dependencies (only `nlohmann/json` for JSON parsing and a TLS library like OpenSSL) with your preferred package manager. On Windows, you can specify your preferred toolchain in the CMake build command with `-DCMAKE_TOOLCHAIN_FILE=path/to/your/toolchain.cmake`.
 3. Compile and run the example:
 
 ```bash
@@ -41,18 +45,28 @@ cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=C:\path\to\vcpkg\scripts\buildsystems
 cmake --build build
 ./build/chat-client
 ```
+> Run the `/info` command in the client to display connection details including TLS status.
 
 ### Client (Python)
 
 ```bash
 cd clients/python
 python -m build
-python -m pip install .\dist\easy_game_chat-0.2.0-py3-none-any.whl
+python -m pip install .\dist\easy_game_chat-0.3.0-py3-none-any.whl
 # or install directly from the source
 pip install .
 python examples/python/main.py
 ```
 
+### Token Generation
+
+To generate a token for authentication, use the following command:
+
+```bash
+go run server.go generate-token <username>
+```
+
+This will generate a token and store its hashed value securely in a `tokens.json` file. The token is valid for 24 hours and can be used for client authentication. Remember to save the token, as it will not be displayed again.
 
 ## Protocol
 

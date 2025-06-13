@@ -17,7 +17,7 @@
  * - Memory-safe C API wrapper
  * 
  * @author Fabio Ardis
- * @version 0.2.0
+ * @version 0.3.0
  * @date 2025-06-02
  */
 
@@ -132,6 +132,7 @@ egc_client_t* egc_create(const char* host, int port);
  * 
  * @param client Valid client instance created with egc_create()
  * @param nickname Desired nickname (must follow validation rules)
+ * @param token User authentication token (optional, can be NULL if the server accepts guest connections)
  * @return true on successful connection, false on failure
  * 
  * Nickname validation rules:
@@ -144,7 +145,7 @@ egc_client_t* egc_create(const char* host, int port);
  * @note If connection fails, check network connectivity and server availability.
  * @see egc_create(), egc_send()
  */
-bool egc_connect(egc_client_t* client, const char* nickname);
+bool egc_connect(egc_client_t* client, const char* nickname, const char* token);
 
 /**
  * @brief Send a chat message to the server
@@ -217,6 +218,8 @@ void egc_poll(egc_client_t* client);
 void egc_destroy(egc_client_t* client);
 
 bool egc_get_connection_info(egc_client_t* client, egc_connection_info_t* info);
+
+bool egc_should_stop(egc_client_t* client);
 
 #ifdef __cplusplus
 }
@@ -1188,21 +1191,21 @@ public:
    * are terminated before the object is destroyed.
    */
   ~EasyGameChat();
-
   /**
-   * @brief Connect to server with nickname
+   * @brief Connect to server with nickname and authentication token
    * 
    * Establishes connection to the chat server and attempts to register
-   * with the specified nickname. This function includes timeout handling
+   * with the specified nickname and token. This function includes timeout handling
    * to prevent indefinite blocking.
    * 
    * @param nickname Desired nickname (must pass validation)
+   * @param token Authentication token required by the server
    * @return true on successful connection, false on failure
    * 
    * @note If already connected, this function returns false.
    * @see disconnect(), sendMessage()
    */
-  bool connect(const std::string& nickname);
+  bool connect(const std::string& nickname, const std::string& token);
 
   /**
    * @brief Send message to chat
@@ -1251,6 +1254,8 @@ public:
   void disconnect();
 
   ConnectionInfo getConnectionInfo() const;
+
+  bool shouldStop() const;
 
 private:
   /**
@@ -1375,7 +1380,7 @@ bool EasyGameChat::connectWithTimeout(int sock, const sockaddr* addr, socklen_t 
   return setBlocking(sock);
 }
 
-bool EasyGameChat::connect(const std::string& nickname) {
+bool EasyGameChat::connect(const std::string& nickname, const std::string& token) {
   if (_running.load()) return false;
   
   // Validate nickname
@@ -1389,6 +1394,7 @@ bool EasyGameChat::connect(const std::string& nickname) {
   nlohmann::json j;
   j["from"] = "Client";
   j["text"] = nickname;
+  j["token"] = token;
 
   bool connected = false;
 
@@ -1442,24 +1448,60 @@ bool EasyGameChat::connect(const std::string& nickname) {
       _sock.store(-1);
       return false;
     }
-  }
 
-  _shouldStop.store(false);
-  _running.store(true);
-  _recvThread = std::thread(&EasyGameChat::recvLoop, this);
-  return true;
+    // Wait for server response
+    std::vector<char> response_buffer(1024);
+    int received = recv(sock, response_buffer.data(), response_buffer.size() - 1, 0);
+    if (received <= 0) {
+        if (received == 0) {
+            std::cerr << "Connection closed by server prematurely." << std::endl;
+        } else {
+            std::cerr << "Error receiving response from server." << std::endl;
+        }
+        closesocket_x(sock);
+        _sock.store(-1);
+        return false;
+    }
+    response_buffer[received] = '\0';
+    std::string response_str(response_buffer.data(), received);
+
+    std::cout << "[DEBUG] Received response: " << response_str << std::endl;
+
+    try {
+        auto response = nlohmann::json::parse(response_str);
+        if (response.contains("status") && response["status"] != "success") {
+            std::string error_msg = response.contains("message") ? 
+                response["message"].get<std::string>() : "Unknown error";
+            std::cerr << "Server rejected connection: " << error_msg << std::endl;
+            closesocket_x(sock);
+            _sock.store(-1);
+            return false;
+        }
+    } catch (const nlohmann::json::exception& e) {
+        std::cerr << "Invalid response from server: " << e.what() << std::endl;
+        closesocket_x(sock);
+        _sock.store(-1);
+        return false;
+    }
+    }
+
+    _shouldStop.store(false);
+    _running.store(true);
+    _recvThread = std::thread(&EasyGameChat::recvLoop, this);
+    return true;
 }
 
 bool EasyGameChat::sendJson(const nlohmann::json& j) {
   if (_sock.load() < 0) return false;
-  
-  try {
+    try {
     std::string jsonStr = j.dump();
     
     // Validate JSON output
     if (!isSecureJson(jsonStr)) {
       return false;
     }
+    
+    //std::cout << "[DEBUG] Sending JSON: " << jsonStr << std::endl;
     
     jsonStr += "\n";
     
@@ -1509,75 +1551,73 @@ void EasyGameChat::recvLoop() {
 
     if (received > 0) {
       buffer[received] = '\0';
-
       //std::cerr << "[DEBUG] RAW MESSAGE RECEIVED: " << std::string(buffer.data(), received) << std::endl;
-      
-      // This should prevent buffer overflow attacks
+
       if (leftover.size() + static_cast<size_t>(received) > MAX_BUFFER_SIZE) {
-        leftover.clear(); // Reset on potential attack
+        leftover.clear();
         continue;
       }
-      
+
       leftover.append(buffer.data(), static_cast<size_t>(received));
 
       size_t pos;
       int messagesProcessed = 0;
-      const int maxMessagesPerLoop = 10; // Prevent message flooding
-      
-      while ((pos = leftover.find('\n')) != std::string::npos && 
-             messagesProcessed < maxMessagesPerLoop) {
+      const int maxMessagesPerLoop = 10;
+
+      while ((pos = leftover.find('\n')) != std::string::npos && messagesProcessed < maxMessagesPerLoop) {
         std::string line = leftover.substr(0, pos);
         leftover.erase(0, pos + 1);
         messagesProcessed++;
 
-        // Line processing
-        if (line.size() > MAX_MESSAGE_LENGTH) continue;
-        
-        // Trim whitespaces
-        while (!line.empty() && std::isspace(line.back())) {
-          line.pop_back();
-        }
-        while (!line.empty() && std::isspace(line.front())) {
-          line.erase(0, 1);
-        }
+        //std::cerr << "[DEBUG] Processing line: " << line << std::endl;
 
-        if (isSecureJson(line)) {
-          try {
-            auto j = nlohmann::json::parse(line);
-            
-            // Validation
-            if (j.is_object() && j.contains("from") && j.contains("text") && 
-                j["from"].is_string() && j["text"].is_string() &&
-                j.size() == 2) { // Only allow exactly these two fields. Might change in the future.
-              
-              std::string from = j["from"];
-              std::string text = j["text"];
-              
-              // Double-validate (first this had isValidNickname, but it's getting the server filtered. This will probably need a better solution later.)
-              if (/* isValidNickname(from) &&  */isValidMessage(text)) {
-                std::lock_guard<std::mutex> lock(_callbackMutex);
-                if (_callback) {
-                  _callback(from, text);
-                }
+        // Split concatenated JSON objects
+        size_t bracePos = 0;
+        while ((bracePos = line.find('{', bracePos)) != std::string::npos) {
+          size_t endBracePos = line.find('}', bracePos);
+          if (endBracePos == std::string::npos) break;
+
+          std::string jsonObject = line.substr(bracePos, endBracePos - bracePos + 1);
+          bracePos = endBracePos + 1;
+
+          if (isSecureJson(jsonObject)) {
+            try {
+              auto message = nlohmann::json::parse(jsonObject);
+
+              if (message.contains("status")) {
+                //std::cerr << "[DEBUG] Status received: " << message["status"].get<std::string>() << std::endl;
+                continue; // Skip processing status as a regular message
               }
+
+              if (message.contains("from") && message.contains("text")) {
+                //std::cerr << "[DEBUG] Parsed JSON: " << message.dump() << std::endl;
+                if (_callback) {
+                  std::lock_guard<std::mutex> lock(_callbackMutex);
+                  _callback(message["from"].get<std::string>(), message["text"].get<std::string>());
+                }
+              } else {
+                std::cerr << "[DEBUG] Unexpected JSON structure: " << message.dump() << std::endl;
+              }
+            } catch (const nlohmann::json::exception& e) {
+              std::cerr << "[DEBUG] JSON Parsing Error: " << e.what() << std::endl;
             }
-          } catch (const nlohmann::json::exception&) {
-            // Ignore malformed JSON
+          } else {
+            std::cerr << "[DEBUG] Invalid JSON received: " << jsonObject << std::endl;
           }
         }
       }
-    }
-    else if (received == 0) {
-      std::cout << "Received 0, connection closed.\n";
-      break; // Connection closed
-    }
-    else {
+    } else if (received == 0) {
+      std::cout << "[DEBUG] Connection closed by server." << std::endl;
+      break;
+    } else {
 #ifdef _WIN32
       int err = WSAGetLastError();
       if (err != WSAEWOULDBLOCK) {
 #else
       if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
 #endif
+        std::cerr << "[DEBUG] Error receiving data.\nThis can be caused by a malformed token or an unexpected error from the server.\nPress any button to exit.\n";
+        _shouldStop.store(true);
         break; // Real error
       }
     }
@@ -1660,6 +1700,10 @@ ConnectionInfo EasyGameChat::getConnectionInfo() const {
   return info;
 }
 
+bool EasyGameChat::shouldStop() const {
+  return _shouldStop.load();
+}
+
 } // namespace egc
 
 // C API Implementation
@@ -1693,11 +1737,11 @@ egc_client_t* egc_create(const char* host, int port) {
   }
 }
 
-bool egc_connect(egc_client_t* client, const char* nickname) {
-  if (!client || !client->cpp_client || !nickname || !client->valid->load()) {
+bool egc_connect(egc_client_t* client, const char* nickname, const char* token) {
+  if (!client || !client->cpp_client || !nickname || !token || !client->valid->load()) {
     return false;
   }
-  return client->cpp_client->connect(nickname);
+  return client->cpp_client->connect(nickname, token);
 }
 
 bool egc_send(egc_client_t* client, const char* text) {
@@ -1792,6 +1836,14 @@ bool egc_get_connection_info(egc_client_t* client, egc_connection_info_t* info) 
   } catch (...) {
     return false;
   }
+}
+
+bool egc_should_stop(egc_client_t* client) {
+  if (!client || !client->cpp_client || !client->valid->load()) {
+    return false;
+  }
+
+  return client->cpp_client->shouldStop();
 }
 
 } // extern "C"

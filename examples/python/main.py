@@ -6,13 +6,13 @@ import sys
 import time
 from pathlib import Path
 # I need to remember to delete this once i put the package on pip
-#path_root = Path(__file__).parents[2]
-#sys.path.append(str(path_root))
-#print(sys.path)
+path_root = Path(__file__).parents[2]
+sys.path.append(str(path_root))
+print(sys.path)
 
-#from clients.python.easygamechat import EasyGameChat
+from clients.python.easygamechat import EasyGameChat
 # Remember to install the library before importing it
-from easygamechat import EasyGameChat
+#from easygamechat import EasyGameChat
 
 def main():
     # Get nickname from user
@@ -61,10 +61,13 @@ def main():
     
     client.set_message_callback(on_message)
     
+    # Get token from user
+    token = input("Insert your authentication token: ").strip()
+
     # Connect to server
     print(f"\nConnecting to {host}:{port} {'with TLS' if use_tls else 'without TLS'}...")
     
-    if not client.connect(nickname):
+    if not client.connect(nickname, token):
         print("Error: could not connect to the server")
         return 1
     

@@ -23,41 +23,20 @@ type Client struct {
 	lastSend time.Time
 }
 
-func NewClient(conn net.Conn) *Client {
+func NewClient(conn net.Conn, nickname string) *Client {
 	fmt.Printf("[CLIENT] New client connection from %s\n", conn.RemoteAddr())
-
-	// Set timeout for initial handshake
-	conn.SetReadDeadline(time.Now().Add(time.Duration(ReadTimeoutMs) * time.Millisecond))
-
-	decoder := json.NewDecoder(conn)
-	var hello Message
-
-	fmt.Printf("[CLIENT] Waiting for nickname from %s\n", conn.RemoteAddr())
-	if err := decoder.Decode(&hello); err != nil {
-		fmt.Printf("[ERROR] Failed to read nickname from %s: %v\n", conn.RemoteAddr(), err)
-		conn.Close()
-		return nil
-	}
-
-	fmt.Printf("[CLIENT] Received nickname data: From='%s', Text='%s'\n", hello.From, hello.Text)
-
-	// Sanitize and validate nickname
-	nickname := sanitizeString(hello.Text)
-	fmt.Printf("[CLIENT] Sanitized nickname: '%s' -> '%s'\n", hello.Text, nickname)
-
 	if !isValidNickname(nickname) {
-		fmt.Printf("[ERROR] Invalid nickname '%s' from %s\n", hello.Text, conn.RemoteAddr())
+		fmt.Printf("[ERROR] Invalid nickname '%s' from %s\n", nickname, conn.RemoteAddr())
 		conn.Close()
 		return nil
 	}
 
-	// Check for duplicate nicknames
 	if isNicknameTaken(nickname) {
 		fmt.Printf("[ERROR] Nickname '%s' already taken from %s\n", nickname, conn.RemoteAddr())
 		conn.Close()
 		return nil
 	}
-
+	// Create the client instance
 	client := &Client{
 		conn:     conn,
 		nickname: nickname,

@@ -64,3 +64,6 @@ examples/c-cpp/chat_client.exe
 # TLS
 *.crt
 *.key
+
+# Tokens
+tokens.json

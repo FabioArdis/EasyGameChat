@@ -52,11 +52,21 @@ cmake --build build
 ```bash
 cd clients/python
 python -m build
-python -m pip install .\dist\easy_game_chat-0.2.0-py3-none-any.whl
+python -m pip install .\dist\easy_game_chat-0.3.0-py3-none-any.whl
 # or install directly from the source
 pip install .
 python examples/python/main.py
 ```
+
+### Token Generation
+
+To generate a token for authentication, use the following command:
+
+```bash
+go run server.go generate-token <username>
+```
+
+This will generate a token and store its hashed value securely in a `tokens.json` file. The token is valid for 24 hours and can be used for client authentication. Remember to save the token, as it will not be displayed again.
 
 ## Protocol
 

@@ -207,12 +207,13 @@ class EasyGameChat:
             self.logger.error(f"Failed to setup SSL context: {e}")
             raise TLSError(f"SSL context setup failed: {e}")
     
-    def connect(self, nickname: str) -> bool:
+    def connect(self, nickname: str, token: str) -> bool:
         """
-        Connect to the chat server with the given nickname using TLS if enabled.
+        Connect to the chat server with the given nickname and token using TLS if enabled.
         
         Args:
             nickname: User's nickname (must pass validation)
+            token: Authentication token
             
         Returns:
             True if connection successful, False otherwise
@@ -280,13 +281,30 @@ class EasyGameChat:
             
             self.nickname = nickname
             
-            # Send nickname as initial message
+            # Send nickname and token as initial message
             hello_msg = {
                 "from": "Client",
-                "text": nickname
+                "text": nickname,
+                "token": token
             }
-            
+
+            self.logger.debug(f"Sending initial message: {hello_msg}")
+
             if not self._send_json(hello_msg):
+                self._close_connection()
+                return False
+
+            # Wait for server response after sending the token
+            try:
+                response = active_socket.recv(1024).decode('utf-8')
+                self.logger.debug(f"Received server response: {response}")
+                response_data = json.loads(response)
+                if response_data.get("status") != "success":
+                    self.logger.error(f"Server rejected connection: {response_data.get('message', 'Unknown error')}")
+                    self._close_connection()
+                    return False
+            except json.JSONDecodeError:
+                self.logger.error("Invalid response from server")
                 self._close_connection()
                 return False
             
