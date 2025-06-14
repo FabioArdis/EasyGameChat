@@ -21,13 +21,17 @@ int main() {
   std::cout << "Insert your nickname: ";
   std::getline(std::cin, nickname);
 
+  std::string token;
+  std::cout << "Insert your token: ";
+  std::getline(std::cin, token);
+
   auto* client = egc_create("127.0.0.1", 3000);
   if (!client) {
     std::cerr << "Error: could not create client\n";
     return 1;
   }
 
-  if (!egc_connect(client, nickname.c_str())) {
+  if (!egc_connect(client, nickname.c_str(), token.c_str())) {
     std::cerr << "Error: could not connect to the server\n";
     egc_destroy(client);
     return 1;
@@ -40,7 +44,7 @@ int main() {
   std::cout << "Connected! Write messages and press ENTER to send them (write '/exit' to exit, '/info' for connection info)\n";
 
   std::string input;
-  while (true) {
+  while (!egc_should_stop(client)) {
     std::getline(std::cin, input);
     if (input == "/exit") break;
     if (input == "/info") {

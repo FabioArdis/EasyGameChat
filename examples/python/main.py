@@ -61,10 +61,13 @@ def main():
     
     client.set_message_callback(on_message)
     
+    # Get token from user
+    token = input("Insert your authentication token: ").strip()
+
     # Connect to server
     print(f"\nConnecting to {host}:{port} {'with TLS' if use_tls else 'without TLS'}...")
     
-    if not client.connect(nickname):
+    if not client.connect(nickname, token):
         print("Error: could not connect to the server")
         return 1
     
