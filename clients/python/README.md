@@ -63,7 +63,7 @@ python examples/python/main.py
 To generate a token for authentication, use the following command:
 
 ```bash
-go run server.go generate-token <username>
+go run main.go generate-token <username>
 ```
 
 This will generate a token and store its hashed value securely in a `tokens.json` file. The token is valid for 24 hours and can be used for client authentication. Remember to save the token, as it will not be displayed again.

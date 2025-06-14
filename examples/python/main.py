@@ -6,13 +6,13 @@ import sys
 import time
 from pathlib import Path
 # I need to remember to delete this once i put the package on pip
-path_root = Path(__file__).parents[2]
-sys.path.append(str(path_root))
-print(sys.path)
+#path_root = Path(__file__).parents[2]
+#sys.path.append(str(path_root))
+#print(sys.path)
 
-from clients.python.easygamechat import EasyGameChat
+#from clients.python.easygamechat import EasyGameChat
 # Remember to install the library before importing it
-#from easygamechat import EasyGameChat
+from easygamechat import EasyGameChat
 
 def main():
     # Get nickname from user
