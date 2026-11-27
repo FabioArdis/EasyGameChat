@@ -7,7 +7,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/easygamechat .
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 LABEL org.opencontainers.image.source="https://github.com/FabioArdis/EasyGameChat"
 LABEL org.opencontainers.image.description="EasyGameChat server"
