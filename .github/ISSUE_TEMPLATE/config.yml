@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/FabioArdis/EasyGameChat/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.
+  - name: Documentation
+    url: https://github.com/FabioArdis/EasyGameChat/tree/main/docs
+    about: Read the server, client, protocol, and security guides.

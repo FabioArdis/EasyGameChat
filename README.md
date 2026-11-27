@@ -71,6 +71,10 @@ Pass `-DCMAKE_PREFIX_PATH=/path/to/prefix` when configuring your project if the 
 
 Pre-1.0 and under active development. Current limitations: one room, no message history or offline delivery, no WebSocket transport, and no protocol version negotiation. See the [protocol limits](docs/protocol.md#current-limitations).
 
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities through [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT
