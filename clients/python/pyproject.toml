@@ -9,7 +9,7 @@ description = "An easy and secure Python library for real-time game chat"
 readme = "README.md"
 license = "MIT"
 authors = [
-  { name = "Fabio Ardis", email = "fabioardis@email.com" }
+  { name = "Fabio Ardis", email = "fabioardis@gmail.com" }
 ]
 dependencies = []
 requires-python = ">=3.10"
