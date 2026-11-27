@@ -47,6 +47,13 @@ egc_client_t* egc_create(const char* host, int port) {
   }
 }
 
+bool egc_set_tls_verification(egc_client_t* client, bool verify) {
+  if (!client || !client->cpp_client || !client->valid->load()) {
+    return false;
+  }
+  return client->cpp_client->setTLSVerification(verify);
+}
+
 bool egc_connect(egc_client_t* client, const char* nickname, const char* token) {
   if (!client || !client->cpp_client || !nickname || !token || !client->valid->load()) {
     return false;

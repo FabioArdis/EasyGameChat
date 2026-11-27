@@ -26,6 +26,7 @@ typedef void (*egc_message_callback)(const char* from, const char* text, void* u
 typedef struct egc_client_t egc_client_t;
 
 egc_client_t* egc_create(const char* host, int port);
+bool egc_set_tls_verification(egc_client_t* client, bool verify);
 bool egc_connect(egc_client_t* client, const char* nickname, const char* token);
 bool egc_send(egc_client_t* client, const char* text);
 void egc_set_message_callback(egc_client_t* client, egc_message_callback cb, void* user_data);

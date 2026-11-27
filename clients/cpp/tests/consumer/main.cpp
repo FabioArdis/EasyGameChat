@@ -1,5 +1,6 @@
 #include <easygamechat/easygamechat.hpp>
 
 int main() {
-  return egc::isValidNickname("alice") ? 0 : 1;
+  egc::TLSConfig config;
+  return egc::isValidNickname("alice") && config.verifyCertificate ? 0 : 1;
 }
