@@ -50,6 +50,8 @@ Tokens:
 | `--listen` | `:3000` | Listen address; `127.0.0.1:3000` in development mode |
 | `--cert` | `certs/server.crt` | TLS certificate; `certs/dev.crt` in development mode |
 | `--key` | `certs/server.key` | TLS private key; `certs/dev.key` in development mode |
+| `--log-level` | `info` | `debug`, `info`, `warn`, or `error` |
+| `--log-format` | `text` | `text` or `json` |
 
 There is no configuration file yet. Use flags and `EASYGAMECHAT_JWT_SECRET`.
 
@@ -74,4 +76,4 @@ Development certificates are self-signed. Python and C++ clients verify certific
 
 `Ctrl+C` or `SIGTERM` closes the listener and active connections.
 
-The server writes connection and message activity to stdout. There are no log levels or structured logs yet.
+Logs go to stderr. Use `--log-level` and `--log-format` to change verbosity and output. Message text and tokens are not logged.

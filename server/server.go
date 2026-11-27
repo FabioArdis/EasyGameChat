@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -84,12 +85,13 @@ func StartTLS(ctx context.Context, cfg Config) error {
 	if cfg.DisableAuth {
 		authMode = "none"
 	}
-	fmt.Printf("[SERVER] TLS Server listening on %s...\n", cfg.Addr)
-	fmt.Printf("[SERVER] Max clients: %d\n", MaxClients)
-	fmt.Printf("[SERVER] Using TLS certificate: %s\n", cfg.CertFile)
-	fmt.Printf("[SERVER] Authentication: %s\n", authMode)
+	slog.Info("server listening",
+		"addr", cfg.Addr,
+		"auth", authMode,
+		"cert", cfg.CertFile,
+		"max_clients", MaxClients)
 
-	go debugBroadcaster()
+	go broadcastLoop()
 
 	go func() {
 		<-ctx.Done()
@@ -103,7 +105,7 @@ func StartTLS(ctx context.Context, cfg Config) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			fmt.Println("[ERROR] TLS connection refused:", err)
+			slog.Error("accept failed", "error", err)
 			continue
 		}
 
@@ -112,7 +114,7 @@ func StartTLS(ctx context.Context, cfg Config) error {
 		mutex.RUnlock()
 
 		if currentClients >= MaxClients {
-			fmt.Printf("[WARN] Connection limit reached, rejecting %s\n", conn.RemoteAddr())
+			slog.Warn("connection limit reached", "remote", conn.RemoteAddr().String())
 			conn.Close()
 			continue
 		}
@@ -174,7 +176,7 @@ func handleConnection(conn net.Conn, cfg Config) {
 	buffer := make([]byte, 1024)
 	n, err := conn.Read(buffer)
 	if err != nil {
-		fmt.Println("[ERROR] Failed to read from connection:", err)
+		slog.Debug("handshake read failed", "remote", conn.RemoteAddr().String(), "error", err)
 		conn.Close()
 		return
 	}
@@ -182,7 +184,7 @@ func handleConnection(conn net.Conn, cfg Config) {
 	var initialMessage map[string]string
 	err = json.Unmarshal(buffer[:n], &initialMessage)
 	if err != nil || initialMessage["text"] == "" {
-		fmt.Println("[ERROR] Invalid initial message format or missing nickname")
+		slog.Warn("invalid handshake", "remote", conn.RemoteAddr().String())
 		conn.Close()
 		return
 	}
@@ -192,14 +194,14 @@ func handleConnection(conn net.Conn, cfg Config) {
 	if !cfg.DisableAuth {
 		tokenUsername, err := validateToken(initialMessage["token"], cfg.JWTSecret)
 		if err != nil || !strings.EqualFold(tokenUsername, nickname) {
-			fmt.Println("[ERROR] Invalid token")
+			slog.Warn("authentication failed", "remote", conn.RemoteAddr().String())
 			writeError(conn, "Invalid token")
 			return
 		}
 	}
 
 	if !isValidNickname(nickname) || isNicknameTaken(nickname) {
-		fmt.Println("[ERROR] Nickname unavailable")
+		slog.Warn("nickname unavailable", "nickname", nickname, "remote", conn.RemoteAddr().String())
 		writeError(conn, "Nickname unavailable")
 		return
 	}
@@ -207,6 +209,7 @@ func handleConnection(conn net.Conn, cfg Config) {
 	response := map[string]string{"status": "success"}
 	responseBytes, _ := json.Marshal(response)
 	if _, err := conn.Write(responseBytes); err != nil {
+		slog.Debug("handshake write failed", "remote", conn.RemoteAddr().String(), "error", err)
 		conn.Close()
 		return
 	}
@@ -226,15 +229,16 @@ func RegisterClient(c *Client) {
 	mutex.Lock()
 	clients[c.conn] = c
 	clientCount++
+	count := clientCount
 	mutex.Unlock()
 
-	fmt.Printf("[INFO] %s joined (clients: %d)\n", c.nickname, clientCount)
+	slog.Info("client joined", "nickname", c.nickname, "clients", count)
 
 	msg := Message{From: "Server", Text: c.nickname + " joined the chatroom"}
 	select {
 	case broadcast <- msg:
 	default:
-		fmt.Println("[WARN] Broadcast channel full, dropping join message")
+		slog.Warn("broadcast queue full", "event", "join", "nickname", c.nickname)
 	}
 }
 
@@ -244,35 +248,19 @@ func UnregisterClient(c *Client) {
 		delete(clients, c.conn)
 		clientCount--
 	}
+	count := clientCount
 	mutex.Unlock()
 
 	c.conn.Close()
 	close(c.ch)
 
-	fmt.Printf("[INFO] %s left (clients: %d)\n", c.nickname, clientCount)
+	slog.Info("client left", "nickname", c.nickname, "clients", count)
 
 	msg := Message{From: "Server", Text: c.nickname + " left the chatroom"}
 	select {
 	case broadcast <- msg:
 	default:
-		fmt.Println("[WARN] Broadcast channel full, dropping leave message")
-	}
-}
-
-func broadcaster() {
-	for msg := range broadcast {
-		mutex.RLock()
-		for _, c := range clients {
-			if c.nickname != msg.From {
-				select {
-				case c.ch <- msg:
-				default:
-					// Client's channel is full, skip this message
-					fmt.Printf("[WARN] Message dropped for %s (channel full)\n", c.nickname)
-				}
-			}
-		}
-		mutex.RUnlock()
+		slog.Warn("broadcast queue full", "event", "leave", "nickname", c.nickname)
 	}
 }
 
