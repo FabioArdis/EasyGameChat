@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -17,11 +18,11 @@ import (
 const (
 	MaxClients        = 100
 	ConnectionTimeout = 30 * time.Second
-	ServerPort        = ":3000"
 
-	// TLS Configuration
-	CertFile  = "certs/server.crt"
-	KeyFile   = "certs/server.key"
+	DefaultAddr     = ":3000"
+	DefaultCertFile = "certs/server.crt"
+	DefaultKeyFile  = "certs/server.key"
+
 	tokenFile = "tokens.json"
 )
 
@@ -35,18 +36,37 @@ var (
 	jwtSecretKey = []byte("super-duper-secret-key") // Change this to a secure key in production
 )
 
-func StartTLS() {
-	// Load TLS certificate and key
-	cert, err := tls.LoadX509KeyPair(CertFile, KeyFile)
+type Config struct {
+	Addr        string
+	CertFile    string
+	KeyFile     string
+	DisableAuth bool
+}
 
+func (c Config) withDefaults() Config {
+	if c.Addr == "" {
+		c.Addr = DefaultAddr
+	}
+	if c.CertFile == "" {
+		c.CertFile = DefaultCertFile
+	}
+	if c.KeyFile == "" {
+		c.KeyFile = DefaultKeyFile
+	}
+	return c
+}
+
+func StartTLS(ctx context.Context, cfg Config) error {
+	cfg = cfg.withDefaults()
+
+	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
-		panic(fmt.Sprintf("Failed to load TLS certificate: %v", err))
+		return fmt.Errorf("load TLS certificate: %w", err)
 	}
 
-	// Configure TLS
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12, // Minimum TLS 1.2
+		MinVersion:   tls.VersionTLS12,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
@@ -54,65 +74,39 @@ func StartTLS() {
 		},
 	}
 
-	// Create TLS listener
-	ln, err := tls.Listen("tcp", ServerPort, tlsConfig)
-
+	ln, err := tls.Listen("tcp", cfg.Addr, tlsConfig)
 	if err != nil {
-		panic(fmt.Sprintf("Failed to start TLS listener: %v", err))
+		return fmt.Errorf("listen on %s: %w", cfg.Addr, err)
 	}
 	defer ln.Close()
 
-	fmt.Printf("[SERVER] TLS Server listening on port %s...\n", ServerPort)
+	authMode := "token"
+	if cfg.DisableAuth {
+		authMode = "none"
+	}
+	fmt.Printf("[SERVER] TLS Server listening on %s...\n", cfg.Addr)
 	fmt.Printf("[SERVER] Max clients: %d\n", MaxClients)
-	fmt.Printf("[SERVER] Using TLS certificate: %s\n", CertFile)
+	fmt.Printf("[SERVER] Using TLS certificate: %s\n", cfg.CertFile)
+	fmt.Printf("[SERVER] Authentication: %s\n", authMode)
 
 	go debugBroadcaster()
 
-	for {
-		conn, err := ln.Accept()
-
-		if err != nil {
-			fmt.Println("[ERROR] TLS Connection refused:", err)
-			continue
-		}
-
-		// Check connection limits
-		mutex.RLock()
-		currentClients := clientCount
-		mutex.RUnlock()
-
-		if currentClients >= MaxClients {
-			fmt.Printf("[WARN] Connection limit reached, rejecting %s\n", conn.RemoteAddr())
-		}
-
-		go handleConnection(conn)
-	}
-}
-
-// Old Start (we may keep this for compatibility or further developmnet)
-
-func Start() {
-	ln, err := net.Listen("tcp", ServerPort)
-	if err != nil {
-		panic(err)
-	}
-	defer ln.Close()
-
-	fmt.Printf("[WARNING] USING TLS-LESS VERSION\n")
-
-	fmt.Printf("[SERVER] Listening on port %s...\n", ServerPort)
-	fmt.Printf("[SERVER] Max clients: %d\n", MaxClients)
-
-	go debugBroadcaster()
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+		closeClients()
+	}()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Println("[ERROR] Connection refused:", err)
+			if ctx.Err() != nil {
+				return nil
+			}
+			fmt.Println("[ERROR] TLS connection refused:", err)
 			continue
 		}
 
-		// Check connection limits
 		mutex.RLock()
 		currentClients := clientCount
 		mutex.RUnlock()
@@ -123,7 +117,16 @@ func Start() {
 			continue
 		}
 
-		go handleConnection(conn)
+		go handleConnection(conn, cfg)
+	}
+}
+
+func closeClients() {
+	mutex.RLock()
+	defer mutex.RUnlock()
+
+	for _, c := range clients {
+		c.conn.Close()
 	}
 }
 
@@ -159,11 +162,9 @@ func validateToken(token string) bool {
 	return false
 }
 
-func handleConnection(conn net.Conn) {
-	// Set connection timeout only for initial handshake
+func handleConnection(conn net.Conn, cfg Config) {
 	conn.SetReadDeadline(time.Now().Add(ConnectionTimeout))
 
-	// Read initial message for token validation
 	buffer := make([]byte, 1024)
 	n, err := conn.Read(buffer)
 	if err != nil {
@@ -172,37 +173,31 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Log the received message for debugging
-	fmt.Printf("[DEBUG] Received initial message: %s\n", string(buffer[:n]))
-
-	// Parse token and nickname from the message
 	var initialMessage map[string]string
 	err = json.Unmarshal(buffer[:n], &initialMessage)
-	if err != nil || initialMessage["token"] == "" || initialMessage["text"] == "" {
-		fmt.Println("[ERROR] Invalid initial message format or missing token/nickname")
+	if err != nil || initialMessage["text"] == "" {
+		fmt.Println("[ERROR] Invalid initial message format or missing nickname")
 		conn.Close()
 		return
 	}
 
 	nickname := initialMessage["text"]
 
-	// Validate the token
-	fmt.Printf("[DEBUG] Validating token: %s\n", initialMessage["token"])
-	if !validateToken(initialMessage["token"]) {
-		fmt.Println("[ERROR] Invalid token")
-		response := map[string]string{"status": "error", "message": "Invalid token"}
-		responseBytes, _ := json.Marshal(response)
-		conn.Write(responseBytes)
-		conn.Close()
-		return
+	if !cfg.DisableAuth {
+		if initialMessage["token"] == "" || !validateToken(initialMessage["token"]) {
+			fmt.Println("[ERROR] Invalid token")
+			response := map[string]string{"status": "error", "message": "Invalid token"}
+			responseBytes, _ := json.Marshal(response)
+			conn.Write(responseBytes)
+			conn.Close()
+			return
+		}
 	}
 
-	// Send success response
 	response := map[string]string{"status": "success"}
 	responseBytes, _ := json.Marshal(response)
 	conn.Write(responseBytes)
 
-	// Create and register the client using the nickname from the initial message
 	client := NewClient(conn, nickname)
 	if client == nil {
 		return
@@ -211,9 +206,6 @@ func handleConnection(conn net.Conn) {
 	RegisterClient(client)
 	defer UnregisterClient(client)
 
-	fmt.Printf("[INFO] %s joined (clients: %d)\n", client.nickname, clientCount)
-
-	// Client handles clearing timeouts in Listen()
 	client.Listen()
 }
 
