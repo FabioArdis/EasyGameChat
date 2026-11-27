@@ -8,10 +8,7 @@ import ssl
 import json
 import threading
 import time
-import re
-import string
 from typing import Optional, Callable, Dict, Any
-from dataclasses import dataclass
 import logging
 
 # Constants
@@ -32,6 +29,10 @@ class ValidationError(EasyGameChatError):
 
 class ConnectionError(EasyGameChatError):
     """Raised when connection operations fail"""
+    pass
+
+class TLSError(EasyGameChatError):
+    """Raised when TLS setup fails"""
     pass
 
 def is_valid_nickname(nickname: str) -> bool:
@@ -114,6 +115,43 @@ def is_secure_json(json_str: str) -> bool:
     
     return brace_count == 0 and not in_string
 
+def _split_first_json(data: bytes):
+    """Return the first complete JSON object and the remaining bytes."""
+    start = -1
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index, byte in enumerate(data):
+        if start == -1:
+            if byte == ord('{'):
+                start = index
+                depth = 1
+            continue
+
+        if escaped:
+            escaped = False
+            continue
+        if byte == ord('\\') and in_string:
+            escaped = True
+            continue
+        if byte == ord('"'):
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+
+        if byte == ord('{'):
+            depth += 1
+        elif byte == ord('}'):
+            depth -= 1
+            if depth == 0:
+                return data[start:index + 1], data[index + 1:]
+
+    if start >= 0:
+        return None, data[start:]
+    return None, data
+
 class EasyGameChat:
     """
     EasyGameChat Python client with security features and rate limiting.
@@ -161,6 +199,7 @@ class EasyGameChat:
         self.running = False
         self.should_stop = False
         self.recv_thread: Optional[threading.Thread] = None
+        self._pending = b""
         self.message_callback: Optional[Callable[[str, str], None]] = None
         self.callback_lock = threading.Lock()
         self.send_lock = threading.Lock()
@@ -206,20 +245,50 @@ class EasyGameChat:
         except Exception as e:
             self.logger.error(f"Failed to setup SSL context: {e}")
             raise TLSError(f"SSL context setup failed: {e}")
+
+    def _read_status_response(self, active_socket) -> Optional[bytes]:
+        """Read the first JSON object without losing any following bytes."""
+        data = self._pending
+        deadline = time.time() + CONNECT_TIMEOUT_MS / 1000.0
+
+        while time.time() < deadline:
+            message, rest = _split_first_json(data)
+            if message is not None:
+                self._pending = rest
+                return message
+
+            if len(data) > MAX_BUFFER_SIZE:
+                return None
+
+            try:
+                chunk = active_socket.recv(MAX_BUFFER_SIZE)
+            except socket.timeout:
+                continue
+            except (ssl.SSLError, socket.error):
+                return None
+
+            if not chunk:
+                return None
+
+            data += chunk
+
+        return None
     
-    def connect(self, nickname: str, token: str) -> bool:
+    def connect(self, nickname: str, token: str = "") -> bool:
         """
         Connect to the chat server with the given nickname and token using TLS if enabled.
         
         Args:
             nickname: User's nickname (must pass validation)
-            token: Authentication token
+            token: Authentication token (optional when the server disables authentication)
             
         Returns:
             True if connection successful, False otherwise
         """
         if self.running:
             return False
+
+        self._pending = b""
         
         # Validate nickname
         if not is_valid_nickname(nickname):
@@ -295,16 +364,21 @@ class EasyGameChat:
                 return False
 
             # Wait for server response after sending the token
-            try:
-                response = active_socket.recv(1024).decode('utf-8')
-                self.logger.debug(f"Received server response: {response}")
-                response_data = json.loads(response)
-                if response_data.get("status") != "success":
-                    self.logger.error(f"Server rejected connection: {response_data.get('message', 'Unknown error')}")
-                    self._close_connection()
-                    return False
-            except json.JSONDecodeError:
+            response = self._read_status_response(active_socket)
+            if response is None:
                 self.logger.error("Invalid response from server")
+                self._close_connection()
+                return False
+
+            try:
+                response_data = json.loads(response.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.logger.error("Invalid response from server")
+                self._close_connection()
+                return False
+
+            if response_data.get("status") != "success":
+                self.logger.error(f"Server rejected connection: {response_data.get('message', 'Unknown error')}")
                 self._close_connection()
                 return False
             
@@ -372,7 +446,8 @@ class EasyGameChat:
             self.should_stop = True
             self.running = False
             
-            if self.recv_thread and self.recv_thread.is_alive():
+            if (self.recv_thread and self.recv_thread.is_alive()
+                    and self.recv_thread is not threading.current_thread()):
                 self.recv_thread.join(timeout=1.0)
             
             self._close_connection()
@@ -484,7 +559,8 @@ class EasyGameChat:
     
     def _recv_loop(self):
         """Main receive loop running in separate thread."""
-        buffer = b''
+        buffer = self._pending
+        self._pending = b''
         max_messages_per_loop = 10  # Prevent message flooding
         active_socket = self._get_active_socket()
         
@@ -513,10 +589,7 @@ class EasyGameChat:
                         line = line_bytes.decode('utf-8').strip()
                     except UnicodeDecodeError:
                         continue  # Skip invalid UTF-8
-                    
-                    if len(line) > MAX_MESSAGE_LENGTH:
-                        continue
-                    
+
                     if is_secure_json(line):
                         self._process_message(line)
                         
@@ -544,16 +617,15 @@ class EasyGameChat:
                 
                 from_user = data['from']
                 text = data['text']
-                
-                # Double-validate with our secure functions
-                """ like in c++, i have removed temporarily is_valid_nickname(from_user) and """ 
-                if is_valid_message(text): 
+
+                if is_valid_message(text):
                     with self.callback_lock:
-                        if self.message_callback:
-                            try:
-                                self.message_callback(from_user, text)
-                            except Exception as e:
-                                self.logger.error(f"Callback error: {e}")
+                        callback = self.message_callback
+                    if callback:
+                        try:
+                            callback(from_user, text)
+                        except Exception as e:
+                            self.logger.error(f"Callback error: {e}")
                                 
         except json.JSONDecodeError:
             pass  # Ignore malformed JSON
@@ -625,32 +697,32 @@ def egc_create_with_certs(host: str, port: int, verify_cert: bool = True,
     except Exception:
         return None
 
-def egc_connect(handle: int, nickname: str) -> bool:
-    """Connect client to server with nickname."""
+def egc_connect(handle: int, nickname: str, token: str = "") -> bool:
+    """Connect client to server with nickname and token."""
     with _clients_lock:
         client = _clients.get(handle)
-        if not client:
-            return False
-        return client.connect(nickname)
+    if not client:
+        return False
+    return client.connect(nickname, token)
 
 def egc_send(handle: int, text: str) -> bool:
     """Send message through client."""
     with _clients_lock:
         client = _clients.get(handle)
-        if not client:
-            return False
-        return client.send_message(text)
+    if not client:
+        return False
+    return client.send_message(text)
 
 def egc_set_message_callback(handle: int, callback: Optional[Callable[[str, str], None]]):
     """Set message callback for client."""
     with _clients_lock:
         client = _clients.get(handle)
-        if client:
-            client.set_message_callback(callback)
+    if client:
+        client.set_message_callback(callback)
 
 def egc_destroy(handle: int):
     """Destroy client and free resources."""
     with _clients_lock:
         client = _clients.pop(handle, None)
-        if client:
-            client.disconnect()
+    if client:
+        client.disconnect()
