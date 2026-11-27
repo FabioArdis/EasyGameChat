@@ -72,6 +72,25 @@ TLS 1.2 or later is required. Production certificates must be valid for the host
 
 Development certificates are self-signed. Python and C++ clients verify certificates by default, so they must explicitly opt out for the development server.
 
+## Docker
+
+The release image runs the production server and expects certificates at `/certs`:
+
+```bash
+docker run --rm -p 3000:3000 \
+  -e EASYGAMECHAT_JWT_SECRET \
+  -v "$PWD/certs:/certs:ro" \
+  ghcr.io/fabioardis/easygamechat:0.4.0
+```
+
+The image runs as UID 10001. Make sure the certificate and key are readable by that user, or add `--user "$(id -u):$(id -g)"`.
+
+Generate a token with the same image:
+
+```bash
+docker run --rm -e EASYGAMECHAT_JWT_SECRET ghcr.io/fabioardis/easygamechat:0.4.0 generate-token alice
+```
+
 ## Shutdown and logs
 
 `Ctrl+C` or `SIGTERM` closes the listener and active connections.

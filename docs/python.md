@@ -2,7 +2,7 @@
 
 The Python client requires Python 3.10 or later.
 
-> The current PyPI release is 0.3.0. The C-style API fixes and the behavior described here are on `main` for 0.4.0.
+> These docs describe version 0.4.0.
 
 ## Install
 
