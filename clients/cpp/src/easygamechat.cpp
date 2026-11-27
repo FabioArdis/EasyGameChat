@@ -80,20 +80,32 @@ std::vector<std::string> extractJsonObjects(std::string& buffer) {
 
 }  // namespace
 
-EasyGameChat::EasyGameChat(const std::string& host, int port, bool useTLS)
+EasyGameChat::EasyGameChat(const std::string& host, int port, bool useTLS,
+                           const TLSConfig& tlsConfig)
     : _host(host),
       _port(port),
       _winsockInit(new WinSockInitializer()),
       _tlsInit(new TLSInitializer()),
       _useTLS(useTLS),
+      _tlsConfig(tlsConfig),
       _lastSendTime(std::chrono::steady_clock::now()) {
   if (_useTLS) {
-    _tlsSocket.reset(new TLSSocket());
+    _tlsSocket.reset(new TLSSocket(_tlsConfig));
   }
 }
 
 EasyGameChat::~EasyGameChat() {
   disconnect();
+}
+
+bool EasyGameChat::setTLSVerification(bool verify) {
+  if (!_useTLS || _running.load()) {
+    return false;
+  }
+
+  _tlsConfig.verifyCertificate = verify;
+  _tlsSocket.reset(new TLSSocket(_tlsConfig));
+  return true;
 }
 
 bool EasyGameChat::sendJson(const std::string& jsonStr) {

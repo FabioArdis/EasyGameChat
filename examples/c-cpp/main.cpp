@@ -32,6 +32,14 @@ int main() {
     return 1;
   }
 
+  if (!egc_set_tls_verification(client, false)) {
+    std::cerr << "Error: could not configure TLS\n";
+    egc_destroy(client);
+    return 1;
+  }
+
+  std::cout << "Warning: TLS certificate verification is disabled for this local example.\n";
+
   if (!egc_connect(client, nickname.c_str(), token.c_str())) {
     std::cerr << "Error: could not connect to the server\n";
     egc_destroy(client);

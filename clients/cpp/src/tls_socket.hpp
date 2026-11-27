@@ -39,7 +39,7 @@ class WinSockInitializer {
 
 class TLSSocket {
  public:
-  TLSSocket();
+  explicit TLSSocket(const TLSConfig& config);
   ~TLSSocket();
 
   TLSSocket(const TLSSocket&) = delete;
@@ -77,6 +77,7 @@ class TLSSocket {
   SSL* ssl = nullptr;
 #endif
 
+  bool verifyCertificate_;
   int socket;
   bool connected = false;
 };

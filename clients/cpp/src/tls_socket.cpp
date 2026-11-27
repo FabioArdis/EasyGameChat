@@ -9,6 +9,7 @@
 #else
 #include <openssl/evp.h>
 #include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 #endif
 
@@ -17,7 +18,6 @@ namespace {
 
 constexpr int kRecvTimeoutMs = 100;
 constexpr int kTlsHandshakeTimeoutMs = 10000;
-constexpr bool kVerifyTlsCertificate = false;
 
 }  // namespace
 
@@ -44,7 +44,8 @@ WinSockInitializer::~WinSockInitializer() {
 #endif
 }
 
-TLSSocket::TLSSocket() : socket(-1) {
+TLSSocket::TLSSocket(const TLSConfig& config)
+    : verifyCertificate_(config.verifyCertificate), socket(-1) {
 #ifdef _WIN32
   readBuffer.resize(16384);
   writeBuffer.resize(16384);
@@ -207,7 +208,10 @@ bool TLSSocket::performTLSHandshake(const std::string& host) {
 bool TLSSocket::performWindowsTLSHandshake(const std::string& host) {
   SCHANNEL_CRED credData{};
   credData.dwVersion = SCHANNEL_CRED_VERSION;
-  credData.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION;
+  credData.dwFlags = SCH_CRED_NO_DEFAULT_CREDS;
+  if (!verifyCertificate_) {
+    credData.dwFlags |= SCH_CRED_MANUAL_CRED_VALIDATION;
+  }
 
   SECURITY_STATUS status = AcquireCredentialsHandle(
       nullptr, const_cast<SEC_CHAR*>(UNISP_NAME), SECPKG_CRED_OUTBOUND,
@@ -456,9 +460,9 @@ ConnectionInfo TLSSocket::getWindowsConnectionInfo(ConnectionInfo info) const {
       char cn[256];
       DWORD cnSize = sizeof(cn);
 
+      info.server_cert_valid = verifyCertificate_;
       if (CertGetNameStringA(certContext, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, cn, cnSize) > 1) {
         info.server_cert_cn = cn;
-        info.server_cert_valid = true;
       }
 
       CertFreeCertificateContext(certContext);
@@ -478,9 +482,10 @@ bool TLSSocket::performOpenSSLHandshake(const std::string& host) {
 
   SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
   SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  SSL_CTX_set_verify(ctx, verifyCertificate_ ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, nullptr);
 
-  if (!kVerifyTlsCertificate) {
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+  if (verifyCertificate_ && SSL_CTX_set_default_verify_paths(ctx) != 1) {
+    return false;
   }
 
   ssl = SSL_new(ctx);
@@ -493,6 +498,23 @@ bool TLSSocket::performOpenSSLHandshake(const std::string& host) {
   }
 
   SSL_set_tlsext_host_name(ssl, host.c_str());
+
+  if (verifyCertificate_) {
+    unsigned char address[4];
+    X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
+
+    if (inet_pton(AF_INET, host.c_str(), address) == 1) {
+      if (X509_VERIFY_PARAM_set1_ip_asc(param, host.c_str()) != 1) {
+        return false;
+      }
+    } else {
+      X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+      if (X509_VERIFY_PARAM_set1_host(param, host.c_str(), 0) != 1) {
+        return false;
+      }
+    }
+  }
+
   SSL_set_connect_state(ssl);
 
   if (!detail::setNonBlocking(socket)) {
@@ -539,9 +561,10 @@ ConnectionInfo TLSSocket::getOpenSSLConnectionInfo(ConnectionInfo info) const {
       info.tls_version = version;
     }
 
+    bool hasCertificate = false;
     X509* cert = SSL_get_peer_certificate(ssl);
     if (cert) {
-      info.server_cert_valid = true;
+      hasCertificate = true;
 
       const X509_NAME* subject = X509_get_subject_name(cert);
       if (subject) {
@@ -567,8 +590,8 @@ ConnectionInfo TLSSocket::getOpenSSLConnectionInfo(ConnectionInfo info) const {
     }
 
     long verifyResult = SSL_get_verify_result(ssl);
-    if (verifyResult != X509_V_OK) {
-      info.server_cert_valid = false;
+    info.server_cert_valid = verifyCertificate_ && hasCertificate && verifyResult == X509_V_OK;
+    if (verifyCertificate_ && verifyResult != X509_V_OK) {
       info.tls_error =
           "Certificate verification failed: " + std::string(X509_verify_cert_error_string(verifyResult));
     }

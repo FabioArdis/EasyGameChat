@@ -30,6 +30,10 @@ struct ConnectionInfo {
   std::string tls_error;
 };
 
+struct TLSConfig {
+  bool verifyCertificate = true;
+};
+
 bool isValidNickname(const std::string& nickname);
 bool isValidMessage(const std::string& message);
 bool isSecureJson(const std::string& str);
@@ -42,12 +46,14 @@ class EasyGameChat {
  public:
   using MessageCallback = std::function<void(const std::string& from, const std::string& text)>;
 
-  EasyGameChat(const std::string& host, int port, bool useTLS = true);
+  EasyGameChat(const std::string& host, int port, bool useTLS = true,
+               const TLSConfig& tlsConfig = TLSConfig{});
   ~EasyGameChat();
 
   EasyGameChat(const EasyGameChat&) = delete;
   EasyGameChat& operator=(const EasyGameChat&) = delete;
 
+  bool setTLSVerification(bool verify);
   bool connect(const std::string& nickname, const std::string& token);
   bool sendMessage(const std::string& text);
   void setMessageCallback(MessageCallback cb);
@@ -70,8 +76,9 @@ class EasyGameChat {
   std::mutex _callbackMutex;
   std::unique_ptr<WinSockInitializer> _winsockInit;
   std::unique_ptr<TLSInitializer> _tlsInit;
-  std::unique_ptr<TLSSocket> _tlsSocket;
   bool _useTLS;
+  TLSConfig _tlsConfig;
+  std::unique_ptr<TLSSocket> _tlsSocket;
   std::chrono::steady_clock::time_point _lastSendTime;
   std::mutex _sendMutex;
 };

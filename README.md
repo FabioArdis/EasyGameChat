@@ -51,6 +51,8 @@ target_link_libraries(your_target PRIVATE easygamechat::easygamechat)
 
 Build dependencies are CMake, a C++14 compiler, and `nlohmann/json`; OpenSSL is required on Linux and macOS. Windows uses Schannel.
 
+Certificate verification is enabled by default. The example disables it for the local self-signed development server with `egc_set_tls_verification`. Do not disable it in production.
+
 Run the example:
 
 ```bash

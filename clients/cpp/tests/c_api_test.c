@@ -14,6 +14,9 @@ int main(void) {
   if (!client) {
     return 1;
   }
+  if (!egc_set_tls_verification(client, false)) {
+    return 5;
+  }
 
   egc_connection_info_t info;
   if (!egc_get_connection_info(client, &info)) {

@@ -17,6 +17,9 @@ void expect(bool condition, const std::string& label) {
 }  // namespace
 
 int main() {
+  egc::TLSConfig tlsConfig;
+  expect(tlsConfig.verifyCertificate, "tls verification default");
+
   expect(egc::isValidNickname("alice"), "nickname simple");
   expect(egc::isValidNickname("Alice-1"), "nickname letters and digits");
   expect(egc::isValidNickname("a_b"), "nickname underscore");
