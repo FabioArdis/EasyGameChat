@@ -784,12 +784,24 @@ public:
       if (cert) {
         info.server_cert_valid = true;
 
-        X509_NAME* subject = X509_get_subject_name(cert);
+        const X509_NAME* subject = X509_get_subject_name(cert);
         if (subject) {
-          char cn_buff[256];
-          int len = X509_NAME_get_text_by_NID(subject, NID_commonName, cn_buf, sizeof(cn_buf));
-          if (len > 0) {
-            info.server_cert_cn = std::string(cn_buf, len);
+          int commonNameIndex = X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
+          if (commonNameIndex >= 0) {
+            const X509_NAME_ENTRY* entry = X509_NAME_get_entry(subject, commonNameIndex);
+            if (entry) {
+              const ASN1_STRING* commonNameData = X509_NAME_ENTRY_get_data(entry);
+              unsigned char* commonNameUtf8 = nullptr;
+              int len = ASN1_STRING_to_UTF8(&commonNameUtf8, commonNameData);
+              if (len > 0) {
+                info.server_cert_cn.assign(
+                    reinterpret_cast<const char*>(commonNameUtf8),
+                    static_cast<size_t>(len));
+              }
+              if (commonNameUtf8) {
+                OPENSSL_free(commonNameUtf8);
+              }
+            }
           }
         }
 
@@ -1544,9 +1556,19 @@ void EasyGameChat::recvLoop() {
       timeout.tv_usec = RECV_TIMEOUT_MS * 1000;
 
       int selectResult = select(_sock.load() + 1, &readSet, nullptr, nullptr, &timeout);
-      if (selectResult < 0) continue;
+      if (selectResult < 0) {
+#ifdef _WIN32
+        if (WSAGetLastError() == WSAEINTR) continue;
+#else
+        if (errno == EINTR) continue;
+#endif
+        break;
+      }
+      if (selectResult == 0) {
+        continue; // Timeout - no data available
+      }
 
-      ssize_t received = recv(_sock.load(), buffer.data(), buffer.size() - 1, 0);
+      received = recv(_sock.load(), buffer.data(), buffer.size() - 1, 0);
     }
 
     if (received > 0) {
