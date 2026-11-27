@@ -60,6 +60,7 @@ Pass `-DCMAKE_PREFIX_PATH=/path/to/prefix` when configuring your project if the 
 
 ## Documentation
 
+- [Documentation site](https://easygamechat.gitbook.io/easygamechat-docs)
 - [Overview and quickstart](docs/README.md)
 - [Server](docs/server.md)
 - [Python client](docs/python.md)

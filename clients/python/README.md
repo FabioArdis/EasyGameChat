@@ -42,6 +42,7 @@ client.connect("alice", token)
 
 ## Documentation
 
+- [Documentation site](https://easygamechat.gitbook.io/easygamechat-docs)
 - [Python client guide](https://github.com/FabioArdis/EasyGameChat/blob/main/docs/python.md)
 - [Server setup](https://github.com/FabioArdis/EasyGameChat/blob/main/docs/server.md)
 - [Protocol](https://github.com/FabioArdis/EasyGameChat/blob/main/docs/protocol.md)
