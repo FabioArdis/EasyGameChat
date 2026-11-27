@@ -33,17 +33,30 @@ go run main.go
 
 ### Client (C++)
 
-1. Include `EasyGameChat.h` in your project.
-2. Install the required dependencies (only `nlohmann/json` for JSON parsing and a TLS library like OpenSSL) with your preferred package manager. On Windows, you can specify your preferred toolchain in the CMake build command with `-DCMAKE_TOOLCHAIN_FILE=path/to/your/toolchain.cmake`.
-3. Compile and run the example:
+Build and install the library:
+
+```bash
+cmake -S clients/cpp -B build
+cmake --build build
+cmake --install build --prefix /path/to/prefix
+```
+
+Then link `easygamechat::easygamechat`:
+
+```cmake
+find_package(easygamechat CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE easygamechat::easygamechat)
+```
+
+Build dependencies are CMake, a C++14 compiler, and `nlohmann/json`; OpenSSL is required on Linux and macOS. Windows uses Schannel.
+
+Run the example:
 
 ```bash
 cd examples/c-cpp
 cmake -B build -S .
-# If using vcpkg, specify the toolchain file:
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=C:\path\to\vcpkg\scripts\buildsystems\vcpkg.cmake
 cmake --build build
-./build/chat-client
+./build/chat_client
 ```
 > Run the `/info` command in the client to display connection details including TLS status.
 

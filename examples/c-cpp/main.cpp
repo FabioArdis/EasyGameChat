@@ -10,8 +10,9 @@
 #define SECURITY_WIN32
 #endif
 
-#include "../../clients/c-cpp/EasyGameChat.h"
+#include <easygamechat/easygamechat.h>
 
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <thread>

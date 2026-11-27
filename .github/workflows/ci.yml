@@ -85,8 +85,26 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev nlohmann-json3-dev
 
-      - name: Configure
-        run: cmake -S examples/c-cpp -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Configure library
+        run: cmake -S clients/cpp -B build-lib -DCMAKE_BUILD_TYPE=Release -DEASYGAMECHAT_BUILD_TESTS=ON
 
-      - name: Build
-        run: cmake --build build --parallel
+      - name: Build library
+        run: cmake --build build-lib --parallel
+
+      - name: Test library
+        run: ctest --test-dir build-lib --output-on-failure
+
+      - name: Install library
+        run: cmake --install build-lib --prefix "$PWD/install"
+
+      - name: Configure consumer
+        run: cmake -S clients/cpp/tests/consumer -B build-consumer -DCMAKE_PREFIX_PATH="$PWD/install"
+
+      - name: Build consumer
+        run: cmake --build build-consumer --parallel
+
+      - name: Configure example
+        run: cmake -S examples/c-cpp -B build-example -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build example
+        run: cmake --build build-example --parallel
