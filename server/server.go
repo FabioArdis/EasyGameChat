@@ -2,13 +2,11 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +21,7 @@ const (
 	DefaultCertFile = "certs/server.crt"
 	DefaultKeyFile  = "certs/server.key"
 
-	tokenFile = "tokens.json"
+	MinJWTSecretLength = 32
 )
 
 var (
@@ -31,9 +29,6 @@ var (
 	mutex       sync.RWMutex
 	broadcast   = make(chan Message, 1000) // Buffered to prevent blocking
 	clientCount int
-
-	// Secret key for JWT validation (STORE THIS SECURELY IF YOU USE THIS IN PRODUCTION)
-	jwtSecretKey = []byte("super-duper-secret-key") // Change this to a secure key in production
 )
 
 type Config struct {
@@ -41,6 +36,7 @@ type Config struct {
 	CertFile    string
 	KeyFile     string
 	DisableAuth bool
+	JWTSecret   []byte
 }
 
 func (c Config) withDefaults() Config {
@@ -58,6 +54,10 @@ func (c Config) withDefaults() Config {
 
 func StartTLS(ctx context.Context, cfg Config) error {
 	cfg = cfg.withDefaults()
+
+	if !cfg.DisableAuth && len(cfg.JWTSecret) < MinJWTSecretLength {
+		return fmt.Errorf("JWT secret must be at least %d bytes", MinJWTSecretLength)
+	}
 
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
@@ -130,36 +130,42 @@ func closeClients() {
 	}
 }
 
-// Add token validation function
-func validateToken(token string) bool {
-	// Parse and validate the JWT token
-	tokenObj, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
-		// Ensure the signing method is HMAC
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+type tokenClaims struct {
+	Username string `json:"username"`
+	jwt.RegisteredClaims
+}
+
+func validateToken(tokenString string, secret []byte) (string, error) {
+	claims := &tokenClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		if token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-		return jwtSecretKey, nil
-	})
-
+		return secret, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 	if err != nil {
-		fmt.Println("[ERROR] Token validation failed:", err)
-		return false
+		return "", err
 	}
-
-	// Check if the token is valid
-	if claims, ok := tokenObj.Claims.(jwt.MapClaims); ok && tokenObj.Valid {
-		// Check token expiration
-		if exp, ok := claims["exp"].(float64); ok {
-			expirationTime := time.Unix(int64(exp), 0)
-			if time.Now().After(expirationTime) {
-				fmt.Println("[ERROR] Token has expired")
-				return false
-			}
-		}
-		return true
+	if !token.Valid {
+		return "", fmt.Errorf("invalid token")
 	}
+	if claims.ExpiresAt == nil {
+		return "", fmt.Errorf("token has no expiration")
+	}
+	if time.Now().After(claims.ExpiresAt.Time) {
+		return "", fmt.Errorf("token has expired")
+	}
+	if claims.Username == "" {
+		return "", fmt.Errorf("token has no username")
+	}
+	return claims.Username, nil
+}
 
-	return false
+func writeError(conn net.Conn, message string) {
+	response := map[string]string{"status": "error", "message": message}
+	responseBytes, _ := json.Marshal(response)
+	conn.Write(responseBytes)
+	conn.Close()
 }
 
 func handleConnection(conn net.Conn, cfg Config) {
@@ -184,19 +190,26 @@ func handleConnection(conn net.Conn, cfg Config) {
 	nickname := initialMessage["text"]
 
 	if !cfg.DisableAuth {
-		if initialMessage["token"] == "" || !validateToken(initialMessage["token"]) {
+		tokenUsername, err := validateToken(initialMessage["token"], cfg.JWTSecret)
+		if err != nil || !strings.EqualFold(tokenUsername, nickname) {
 			fmt.Println("[ERROR] Invalid token")
-			response := map[string]string{"status": "error", "message": "Invalid token"}
-			responseBytes, _ := json.Marshal(response)
-			conn.Write(responseBytes)
-			conn.Close()
+			writeError(conn, "Invalid token")
 			return
 		}
 	}
 
+	if !isValidNickname(nickname) || isNicknameTaken(nickname) {
+		fmt.Println("[ERROR] Nickname unavailable")
+		writeError(conn, "Nickname unavailable")
+		return
+	}
+
 	response := map[string]string{"status": "success"}
 	responseBytes, _ := json.Marshal(response)
-	conn.Write(responseBytes)
+	if _, err := conn.Write(responseBytes); err != nil {
+		conn.Close()
+		return
+	}
 
 	client := NewClient(conn, nickname)
 	if client == nil {
@@ -263,42 +276,24 @@ func broadcaster() {
 	}
 }
 
-// GenerateToken creates a new token and stores it securely
-func GenerateToken(username string) (string, error) {
-	// Create a new token
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"username": username,
-		"exp":      time.Now().Add(24 * time.Hour).Unix(),
-	})
-
-	signedToken, err := token.SignedString(jwtSecretKey)
-	if err != nil {
-		return "", err
+// GenerateToken creates a signed token for username.
+func GenerateToken(username string, secret []byte, ttl time.Duration) (string, error) {
+	if !isValidNickname(username) {
+		return "", fmt.Errorf("invalid username")
+	}
+	if len(secret) < MinJWTSecretLength {
+		return "", fmt.Errorf("JWT secret must be at least %d bytes", MinJWTSecretLength)
 	}
 
-	// Hash the token for secure storage
-	hash := sha256.Sum256([]byte(signedToken))
-	hashedToken := hex.EncodeToString(hash[:])
-
-	// Store the hashed token in a JSON file
-	tokens := make(map[string]string)
-	if _, err := os.Stat(tokenFile); err == nil {
-		data, err := os.ReadFile(tokenFile)
-		if err == nil {
-			json.Unmarshal(data, &tokens)
-		}
+	now := time.Now()
+	claims := tokenClaims{
+		Username: username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			IssuedAt:  jwt.NewNumericDate(now),
+		},
 	}
 
-	tokens[username] = hashedToken
-	data, err := json.Marshal(tokens)
-	if err != nil {
-		return "", err
-	}
-
-	err = os.WriteFile(tokenFile, data, 0644)
-	if err != nil {
-		return "", err
-	}
-
-	return signedToken, nil
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(secret)
 }
