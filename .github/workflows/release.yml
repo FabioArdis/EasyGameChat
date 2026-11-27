@@ -101,11 +101,12 @@ jobs:
           cp -R clients/cpp/CMakeLists.txt clients/cpp/include clients/cpp/src clients/cpp/cmake dist/cpp/
           cp LICENSE dist/cpp/
           tar -czf "dist/easygamechat-cpp-${GITHUB_REF_NAME}.tar.gz" -C dist/cpp .
+          rm -rf dist/cpp
 
       - uses: actions/upload-artifact@v4
         with:
           name: easygamechat-cpp
-          path: dist/*
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   docker:
@@ -160,7 +161,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum * > checksums.txt
+          find . -maxdepth 1 -type f ! -name checksums.txt -print0 | sort -z | xargs -0 sha256sum > checksums.txt
 
       - uses: softprops/action-gh-release@v2
         with:
