@@ -1,0 +1,13 @@
+.git
+.github
+clients
+docs
+examples
+scripts
+certs
+tokens.json
+build
+install
+*.crt
+*.key
+*.log

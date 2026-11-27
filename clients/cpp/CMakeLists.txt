@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(easygamechat VERSION 0.3.0 LANGUAGES C CXX)
+project(easygamechat VERSION 0.4.0 LANGUAGES C CXX)
 
 option(EASYGAMECHAT_BUILD_TESTS "Build EasyGameChat tests" OFF)
 

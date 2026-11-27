@@ -7,7 +7,7 @@
 
 A small chat server and client library for games and applications. JSON over TLS, a Go server, and Python and C++ clients with no engine dependency.
 
-> Pre-1.0. The `main` branch tracks the upcoming 0.4.0 release.
+> Pre-1.0. Current release: 0.4.0.
 
 ## Quick start
 
