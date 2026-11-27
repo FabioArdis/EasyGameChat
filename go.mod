@@ -1,4 +1,4 @@
-module EasyGameChat
+module github.com/FabioArdis/EasyGameChat
 
 go 1.24.3
 

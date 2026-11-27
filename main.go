@@ -1,10 +1,10 @@
 package main
 
 import (
-	"EasyGameChat/server"
 	"context"
 	"flag"
 	"fmt"
+	"github.com/FabioArdis/EasyGameChat/server"
 	"log/slog"
 	"os"
 	"os/signal"
