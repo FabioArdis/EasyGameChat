@@ -2,16 +2,24 @@ package main
 
 import (
 	"EasyGameChat/server"
+	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 )
 
+const (
+	devAddr     = "127.0.0.1:3000"
+	devCertFile = "certs/dev.crt"
+	devKeyFile  = "certs/dev.key"
+)
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "generate-token" {
 		if len(os.Args) != 3 {
-			fmt.Println("Usage: main generate-token <username>")
+			fmt.Println("Usage: easygamechat generate-token <username>")
 			return
 		}
 		username := os.Args[2]
@@ -25,21 +33,58 @@ func main() {
 		return
 	}
 
+	var (
+		dev      bool
+		listen   string
+		certFile string
+		keyFile  string
+	)
+	flag.BoolVar(&dev, "dev", false, "run locally with authentication disabled")
+	flag.StringVar(&listen, "listen", server.DefaultAddr, "listen address")
+	flag.StringVar(&certFile, "cert", server.DefaultCertFile, "TLS certificate file")
+	flag.StringVar(&keyFile, "key", server.DefaultKeyFile, "TLS key file")
+	flag.Parse()
+
+	cfg := server.Config{
+		Addr:     listen,
+		CertFile: certFile,
+		KeyFile:  keyFile,
+	}
+
+	if dev {
+		setFlags := make(map[string]bool)
+		flag.Visit(func(f *flag.Flag) {
+			setFlags[f.Name] = true
+		})
+
+		if !setFlags["listen"] {
+			cfg.Addr = devAddr
+		}
+		if !setFlags["cert"] {
+			cfg.CertFile = devCertFile
+		}
+		if !setFlags["key"] {
+			cfg.KeyFile = devKeyFile
+		}
+		if err := server.EnsureDevCertificate(cfg.CertFile, cfg.KeyFile); err != nil {
+			fmt.Fprintln(os.Stderr, "Error preparing development certificate:", err)
+			os.Exit(1)
+		}
+		cfg.DisableAuth = true
+		fmt.Println("[WARN] Development mode: authentication disabled")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	fmt.Println("=== EasyGameChat Server ===")
 	fmt.Println("Security-focused chat server")
 	fmt.Println("Press Ctrl+C to stop")
 	fmt.Println()
 
-	// Handle graceful shutdown
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-c
-		fmt.Println("\n[SERVER] Shutting down gracefully...")
-		os.Exit(0)
-	}()
-
-	// Start the server in TLS mode
-	server.StartTLS()
+	if err := server.StartTLS(ctx, cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		os.Exit(1)
+	}
+	fmt.Println("[SERVER] Shutting down gracefully...")
 }
