@@ -2,6 +2,7 @@
 #define EASYGAMECHAT_PLATFORM_HPP
 
 #include <cstddef>
+#include <string>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -16,6 +17,7 @@ typedef SSIZE_T ssize_t;
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <string.h>
 #include <sys/select.h>
@@ -124,6 +126,37 @@ inline bool connectWithTimeout(int sock, const sockaddr* addr, socklen_t addrlen
   }
 
   return setBlocking(sock);
+}
+
+inline int connectTcp(const std::string& host, int port, int timeoutMs) {
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+
+  std::string service = std::to_string(port);
+  addrinfo* result = nullptr;
+  if (getaddrinfo(host.c_str(), service.c_str(), &hints, &result) != 0) {
+    return -1;
+  }
+
+  int connectedSocket = -1;
+  for (addrinfo* address = result; address != nullptr; address = address->ai_next) {
+    int sock = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+    if (sock < 0) {
+      continue;
+    }
+
+    if (connectWithTimeout(sock, address->ai_addr, static_cast<socklen_t>(address->ai_addrlen), timeoutMs)) {
+      connectedSocket = sock;
+      break;
+    }
+
+    closeSocket(sock);
+  }
+
+  freeaddrinfo(result);
+  return connectedSocket;
 }
 
 }  // namespace detail
