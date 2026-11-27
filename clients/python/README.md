@@ -21,15 +21,16 @@
 
 ### Server (Go)
 
-1. Install Go 1.18 or later.
-2. Generate a TLS certificte and key with the provided scripts or, preferably, use your own. The server requires a valid certificate and key for secure communication.
-3. Run the server:
+1. Install Go 1.24 or later.
+2. Run the server locally:
 
 ```bash
-go run main.go
+go run . --dev
 ```
 
-> TLS is enabled by default. You can configure certificate paths or disable TLS in the config file or server options.
+`--dev` binds to `127.0.0.1:3000`, generates a development certificate, and disables authentication.
+
+For production, provide a TLS certificate with `--cert` and `--key`, and set `EASYGAMECHAT_JWT_SECRET` to at least 32 characters.
 
 ### Client (C++)
 
@@ -73,13 +74,14 @@ python examples/python/main.py
 
 ### Token Generation
 
-To generate a token for authentication, use the following command:
+Set a secret of at least 32 characters and keep it for the server and token generation:
 
 ```bash
-go run main.go generate-token <username>
+export EASYGAMECHAT_JWT_SECRET="$(openssl rand -hex 32)"
+go run . generate-token <username>
 ```
 
-This will generate a token and store its hashed value securely in a `tokens.json` file. The token is valid for 24 hours and can be used for client authentication. Remember to save the token, as it will not be displayed again.
+The token is valid for 24 hours, bound to the username, and not stored by the server. Save it when it is displayed.
 
 ## Protocol
 
