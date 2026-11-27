@@ -3,8 +3,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cstdint>
-#include <cstring>
 #include <exception>
 #include <string>
 #include <vector>
@@ -164,30 +162,8 @@ bool EasyGameChat::connect(const std::string& nickname, const std::string& token
       }
     }
   } else {
-    int sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int sock = detail::connectTcp(_host, _port, kConnectTimeoutMs);
     if (sock < 0) {
-      return false;
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(_port));
-
-#ifdef _WIN32
-    if (InetPtonA(AF_INET, _host.c_str(), &addr.sin_addr) != 1) {
-      detail::closeSocket(sock);
-      return false;
-    }
-#else
-    if (inet_pton(AF_INET, _host.c_str(), &addr.sin_addr) <= 0) {
-      detail::closeSocket(sock);
-      return false;
-    }
-#endif
-
-    if (!detail::connectWithTimeout(
-            sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr), kConnectTimeoutMs)) {
-      detail::closeSocket(sock);
       return false;
     }
 

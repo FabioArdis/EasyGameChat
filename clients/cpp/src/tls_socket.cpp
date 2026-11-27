@@ -16,6 +16,7 @@
 namespace egc {
 namespace {
 
+constexpr int kConnectTimeoutMs = 5000;
 constexpr int kRecvTimeoutMs = 100;
 constexpr int kTlsHandshakeTimeoutMs = 10000;
 
@@ -57,29 +58,8 @@ TLSSocket::~TLSSocket() {
 }
 
 bool TLSSocket::connect(const std::string& host, int port) {
-  socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  socket = detail::connectTcp(host, port, kConnectTimeoutMs);
   if (socket < 0) {
-    return false;
-  }
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(port));
-
-#ifdef _WIN32
-  if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-    disconnect();
-    return false;
-  }
-#else
-  if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-    disconnect();
-    return false;
-  }
-#endif
-
-  if (::connect(socket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    disconnect();
     return false;
   }
 
@@ -500,10 +480,11 @@ bool TLSSocket::performOpenSSLHandshake(const std::string& host) {
   SSL_set_tlsext_host_name(ssl, host.c_str());
 
   if (verifyCertificate_) {
-    unsigned char address[4];
+    unsigned char address[16];
     X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
 
-    if (inet_pton(AF_INET, host.c_str(), address) == 1) {
+    if (inet_pton(AF_INET, host.c_str(), address) == 1 ||
+        inet_pton(AF_INET6, host.c_str(), address) == 1) {
       if (X509_VERIFY_PARAM_set1_ip_asc(param, host.c_str()) != 1) {
         return false;
       }
