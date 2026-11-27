@@ -31,7 +31,7 @@ Do not commit the secret, certificates, private keys, or generated tokens to the
 - The server accepts at most 100 concurrent clients.
 - Message history is not stored; the server keeps the current room in memory only.
 
-The current server logs connection and message activity to stdout, including message text. Do not treat server logs as confidential.
+Server logs go to stderr and include connection and message metadata, not message text or tokens. Review log retention for your deployment.
 
 ## Client behavior
 
